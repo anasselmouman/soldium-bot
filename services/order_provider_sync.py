@@ -32,8 +32,9 @@ class OrderSyncSnapshot(TypedDict):
 
 
 def user_visible_order_ref(order: dict) -> str:
-    """مرجع الطلب المعروض للعميل (رقم التنفيذ من الواجهة الخارجية)."""
-    return str(order.get("provider_order_id") or "").strip() or "—"
+    """مرجع الطلب المعروض للعميل (رقم الطلب لدى الموزّع فقط)."""
+    provider_ref = str(order.get("provider_order_id") or "").strip()
+    return provider_ref or "—"
 
 
 def load_order_sync_snapshot(order_id: int) -> OrderSyncSnapshot:

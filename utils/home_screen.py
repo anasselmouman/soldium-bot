@@ -466,74 +466,88 @@ async def navigate_to_main_home(
     """مسار موحّد للرجوع للرئيسية من menu:home و order:nav:home."""
     from utils.flow_transcript import purge_flow_transcript
     from utils.living_ui import delete_chat_message, register_living_ui_ids
+    from utils.timed_announcements import deliver_timed_announcements_on_entry
 
     callback_msg = callback.message
     chat_id = callback_msg.chat.id if callback_msg else None
     callback_mid = callback_msg.message_id if callback_msg else None
-
-    target = await _resolve_living_home_target(state, user_id, callback)
-
-    if chat_id is not None:
-        await purge_flow_transcript(bot, state, user_id, chat_id)
-    await state.clear()
-
-    if target is None:
-        if callback_msg is not None:
-            sent = await send_main_home_photo(
-                callback_msg, user_id, is_admin=is_admin
-            )
-            if sent is not None:
-                await register_living_ui_ids(
-                    state,
-                    user_id,
-                    sent.chat.id,
-                    sent.message_id,
-                    has_photo=bool(sent.photo),
-                )
-        return
-
-    living_chat_id, living_message_id, has_photo = target
-
-    if (
-        callback_mid is not None
-        and chat_id is not None
-        and callback_mid != living_message_id
-    ):
-        await delete_chat_message(bot, chat_id, callback_mid)
+    deliver_announcements = False
 
     try:
-        await edit_main_home_by_id(
-            bot,
-            living_chat_id,
-            living_message_id,
-            has_photo,
-            user_id,
-            is_admin=is_admin,
-        )
-    except TelegramBadRequest as exc:
-        if not _is_message_to_edit_not_found(exc):
-            raise
-        logger.warning(
-            "navigate_to_main_home: living message missing chat=%s msg=%s",
-            living_chat_id,
-            living_message_id,
-        )
-        if callback_msg is not None:
-            sent = await send_main_home_photo(
-                callback_msg, user_id, is_admin=is_admin
-            )
-            if sent is not None:
-                living_chat_id = sent.chat.id
-                living_message_id = sent.message_id
-                has_photo = bool(sent.photo)
+        target = await _resolve_living_home_target(state, user_id, callback)
 
-    await register_living_ui_ids(
-        state,
-        user_id,
-        living_chat_id,
-        living_message_id,
-        has_photo=True,
-    )
+        if chat_id is not None:
+            await purge_flow_transcript(bot, state, user_id, chat_id)
+        await state.clear()
+
+        if target is None:
+            if callback_msg is not None:
+                sent = await send_main_home_photo(
+                    callback_msg, user_id, is_admin=is_admin
+                )
+                if sent is not None:
+                    await register_living_ui_ids(
+                        state,
+                        user_id,
+                        sent.chat.id,
+                        sent.message_id,
+                        has_photo=bool(sent.photo),
+                    )
+            deliver_announcements = True
+            return
+
+        living_chat_id, living_message_id, has_photo = target
+
+        if (
+            callback_mid is not None
+            and chat_id is not None
+            and callback_mid != living_message_id
+        ):
+            await delete_chat_message(bot, chat_id, callback_mid)
+
+        try:
+            await edit_main_home_by_id(
+                bot,
+                living_chat_id,
+                living_message_id,
+                has_photo,
+                user_id,
+                is_admin=is_admin,
+            )
+        except TelegramBadRequest as exc:
+            if not _is_message_to_edit_not_found(exc):
+                raise
+            logger.warning(
+                "navigate_to_main_home: living message missing chat=%s msg=%s",
+                living_chat_id,
+                living_message_id,
+            )
+            if callback_msg is not None:
+                sent = await send_main_home_photo(
+                    callback_msg, user_id, is_admin=is_admin
+                )
+                if sent is not None:
+                    living_chat_id = sent.chat.id
+                    living_message_id = sent.message_id
+                    has_photo = bool(sent.photo)
+            deliver_announcements = True
+
+        await register_living_ui_ids(
+            state,
+            user_id,
+            living_chat_id,
+            living_message_id,
+            has_photo=True,
+        )
+    finally:
+        if deliver_announcements:
+            try:
+                await deliver_timed_announcements_on_entry(bot, user_id)
+            except Exception:
+                logger.exception(
+                    "Failed to deliver timed announcements after home reset user_id=%s",
+                    user_id,
+                )
 
 
 async def edit_living_screen(

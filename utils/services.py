@@ -63,6 +63,8 @@ def compute_effective_limits(
 
 
 def order_total_price_dh(service: dict, quantity: int):
-    """التكلفة بالدرهم: السعر لكل 1000 × الكمية / 1000."""
+    """التكلفة بالدرهم: لكل وحدة مباشرة، أو السعر لكل 1000 × الكمية / 1000."""
+    if service.get("price_per_unit"):
+        return to_decimal(service["price"]) * to_decimal(quantity)
     total = (to_decimal(service["price"]) * to_decimal(quantity)) / to_decimal(1000)
     return to_decimal(total)

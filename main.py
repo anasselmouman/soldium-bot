@@ -36,6 +36,7 @@ from handlers.referrals import router as referrals_router
 from handlers.start import router as start_router
 from utils.smart_notification_middleware import SmartNotificationActivityMiddleware
 from utils.smart_notifications import router as smart_notifications_router, send_smart_notification
+from utils.timed_announcements import router as timed_announcements_router
 from utils.home_screen import ensure_welcome_upload_jpeg
 from services.smm_api_router import smm_manager_for_account
 from smm_api import ProviderAuthError, SMMManager
@@ -430,6 +431,7 @@ async def main() -> None:
     # endregion
 
     dp.include_router(smart_notifications_router)
+    dp.include_router(timed_announcements_router)
     dp.include_router(payment_router)
     dp.include_router(crypto_withdraw_router)
     dp.include_router(start_router)

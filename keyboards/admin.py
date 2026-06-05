@@ -13,8 +13,24 @@ def build_admin_menu() -> InlineKeyboardMarkup:
     builder.button(text="🛠 تعديل حالة طلب", callback_data="admin:edit_order_status")
     builder.button(text="🎖️ تعيين شريك", callback_data="admin:assign_partner")
     builder.button(text="💸 معالجة طلبات السحب", callback_data="admin:withdrawals")
+    builder.button(text="📋 طلبات بانتظار الأدمن", callback_data="admin:manual_orders")
     builder.button(text=BTN_MAIN_HOME, callback_data="menu:home")
-    builder.adjust(2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 1, 1)
+    return builder.as_markup()
+
+
+def build_admin_manual_order_actions(order_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✅ تم التنفيذ",
+        callback_data=f"admin:manual:complete:{order_id}",
+    )
+    builder.button(
+        text="❌ رفض واسترداد",
+        callback_data=f"admin:manual:reject:{order_id}",
+    )
+    builder.button(text=BTN_BACK_STEP, callback_data="admin:manual_orders")
+    builder.adjust(2, 1)
     return builder.as_markup()
 
 

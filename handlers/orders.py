@@ -10,7 +10,9 @@ from aiogram.types import CallbackQuery, Message
 from config import ADMIN_ID, CURRENCY_DISPLAY, MAX_ORDER_QUANTITY_CAP
 from database import (
     add_user,
+    assign_provider_order_id,
     create_order_with_balance_hold,
+    get_user,
     refund_order,
     set_provider_order_id,
 )
@@ -27,7 +29,6 @@ from keyboards.orders import (
     build_order_coming_soon_markup,
     build_auto_interactions_disclaimer_keyboard,
     CB_ORDER_OTHER_SERVICES,
-    CB_ORDER_SUBSCRIPTIONS,
 )
 from utils.critical_points import build_critical_points_html
 from utils.ui_branding import ACCOUNT_PERSISTENCE_HTML
@@ -41,9 +42,13 @@ from utils.flow_transcript import (
     purge_flow_transcript,
     reset_flow_transcript,
     send_flow_step_prompt,
+    strip_message_reply_markup,
     transfer_nav_anchor,
+    track_transcript_message,
     track_transcript_user_message,
 )
+from services.order_admin_notify import notify_admin_new_manual_order
+from utils.fulfillment import FULFILLMENT_ADMIN, service_requires_admin
 from utils.order_flow import (
     build_invoice_text,
     build_link_step_prompt,
@@ -67,6 +72,7 @@ from utils.services import (
 from utils.states import OrderFlow
 from utils.fsm_prompt_cleanup import clear_last_prompt
 from utils.living_ui import (
+    delete_chat_message,
     edit_living_ui_message,
     edit_user_living_ui,
     get_living_ui,
@@ -86,6 +92,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 smm_manager = SMMManager()
 ORDER_FLASH_RESTORE_KEY = "order_flash_restore_text"
+IPTV_PANEL_NOTES_MSG_KEY = "iptv_panel_notes_message_id"
 
 
 async def _sync_service_context_in_state(
@@ -111,9 +118,11 @@ def _validate_order_link(
     subsection_key: str | None,
     service: dict,
 ) -> tuple[bool, str]:
-    _, allow_username = resolve_link_prompt(
+    _, allow_username, allow_free_text = resolve_link_prompt(
         platform_key, section_key, subsection_key, service=service
     )
+    if allow_free_text:
+        return (True, "") if str(link or "").strip() else (False, "اكتب اسمك أو دولتك في خانة الرابط.")
     return validate_platform_link(
         link,
         platform_key,
@@ -219,13 +228,17 @@ async def _order_breadcrumb_from_state(
     return _order_breadcrumb_line(*trail)
 
 
-def _order_pre_service_full(body: str, *trail: str) -> str:
+def _order_pre_service_full(body: str, *trail: str, platform_key: str | None = None) -> str:
     bc = _order_breadcrumb_line(*trail)
+    if str(platform_key or "").strip() == "subscriptions":
+        return f"{bc}\n\n{body}"
     return f"{bc}\n\n{ORDER_READ_WARNING}{GUIDANCE_TEXT}\n\n{body}"
 
 
-def _order_pre_service_short(body: str, *trail: str) -> str:
+def _order_pre_service_short(body: str, *trail: str, platform_key: str | None = None) -> str:
     bc = _order_breadcrumb_line(*trail)
+    if str(platform_key or "").strip() == "subscriptions":
+        return f"{bc}\n\n{body}"
     return f"{bc}\n\n{ORDER_READ_WARNING_SHORT}{body}"
 
 
@@ -234,16 +247,82 @@ def _order_caption_text(
     short_body: str,
     *trail: str,
     has_photo: bool = False,
+    platform_key: str | None = None,
 ) -> str:
     """على رسالة الصورة: تعليق قصير يبقى تحت حد 1024 حرف."""
     if has_photo:
-        return f"{_order_pre_service_short(short_body, *trail)}\n{_ORDER_PHOTO_FOOTER}"
+        return (
+            f"{_order_pre_service_short(short_body, *trail, platform_key=platform_key)}"
+            f"\n{_ORDER_PHOTO_FOOTER}"
+        )
     return full_text
 
 
 async def _living_has_photo(state: FSMContext, user_id: int) -> bool:
     _, _, has_photo = await get_living_ui(state, user_id)
     return has_photo
+
+
+async def _order_chat_id(
+    state: FSMContext,
+    user_id: int,
+    message: Message | None = None,
+) -> int | None:
+    if message is not None:
+        return message.chat.id
+    living_chat, _, _ = await get_living_ui(state, user_id)
+    return living_chat
+
+
+async def _clear_iptv_panel_notes_message(
+    bot: Bot,
+    state: FSMContext,
+    chat_id: int,
+) -> None:
+    data = await state.get_data()
+    mid = data.get(IPTV_PANEL_NOTES_MSG_KEY)
+    if isinstance(mid, int):
+        await delete_chat_message(bot, chat_id, mid)
+    await state.update_data(**{IPTV_PANEL_NOTES_MSG_KEY: None})
+
+
+async def _send_subscription_section_notes(
+    bot: Bot,
+    state: FSMContext,
+    chat_id: int,
+    text: str,
+    *,
+    persist_for_panel: bool = False,
+) -> None:
+    """ملاحظات التصنيف كاملة في رسالة نصية."""
+    if persist_for_panel:
+        await _clear_iptv_panel_notes_message(bot, state, chat_id)
+    try:
+        sent = await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    except TelegramBadRequest:
+        return
+    if sent.message_id is None:
+        return
+    if persist_for_panel:
+        await state.update_data(**{IPTV_PANEL_NOTES_MSG_KEY: sent.message_id})
+    else:
+        await track_transcript_message(state, sent.message_id)
+
+
+SUBSCRIPTION_NOTES_ABOVE_HINT = (
+    "📜 <b>اقرأ الملاحظات في الرسالة أعلاه</b> قبل اختيار الخدمة.\n\n"
+)
+
+
+def _subscription_section_main_body(title: str, *, notes_above: bool = False) -> str:
+    hint = SUBSCRIPTION_NOTES_ABOVE_HINT if notes_above else ""
+    return f"<b>{title}</b>\n\n{hint}اختر الخدمة:"
+
+
+def _subscription_section_living_body(title: str, *, with_notes: bool, desc: str) -> str:
+    if with_notes and desc:
+        return f"<b>{title}</b>\n\n{desc}\n\nاختر الخدمة:"
+    return _subscription_section_main_body(title)
 
 
 async def _edit_order_screen(
@@ -267,9 +346,11 @@ async def _edit_order_screen(
         return True
     except TelegramBadRequest as exc:
         logger.debug("_edit_order_screen fallback: %s", exc)
-        if allow_new_message_fallback(message):
+        try:
             await message.answer(text, reply_markup=reply_markup, parse_mode="HTML")
             return True
+        except TelegramBadRequest:
+            return False
     return False
 
 
@@ -306,6 +387,9 @@ async def _prepare_order_nav(
         return None
     await clear_last_prompt(callback.message, state, bot=bot)
     if purge_transcript:
+        await _clear_iptv_panel_notes_message(
+            bot, state, callback.message.chat.id
+        )
         await purge_flow_transcript(
             bot, state, callback.from_user.id, callback.message.chat.id
         )
@@ -321,6 +405,7 @@ def _build_order_success_receipt_html(
     total_price_display: str,
     *,
     breadcrumb_line: str | None = None,
+    admin_fulfillment: bool = False,
 ) -> str:
     from html import escape
 
@@ -334,13 +419,39 @@ def _build_order_success_receipt_html(
         f"• <b>الرابط:</b> <code>{escape(link)}</code>\n"
         f"• <b>الكمية:</b> <code>{quantity}</code>\n"
         f"• <b>التكلفة:</b> <code>{escape(str(total_price_display))} DH</code>\n"
-        "• <b>حالة الطلب:</b> تم إرساله للتنفيذ وهو الآن قيد المعالجة.\n"
+    )
+    if admin_fulfillment:
+        body += (
+            "• <b>حالة الطلب:</b> بانتظار تنفيذ الإدارة — ستصلك التفاصيل قريباً.\n"
+        )
+    else:
+        body += (
+            "• <b>حالة الطلب:</b> تم إرساله للتنفيذ وهو الآن قيد المعالجة.\n"
+        )
+    body += (
         f"{sep}\n"
         "يمكنك متابعة حالته من قسم [ طلباتي ] داخل [ حسابي ]. احتفظ برقم الطلب عند التواصل مع الدعم."
     )
     if breadcrumb_line:
         return f"{breadcrumb_line}\n\n{body}"
     return body
+
+
+async def _submit_order_to_provider(
+    service: dict,
+    link: str,
+    quantity: int,
+    api_account: str,
+) -> str:
+    provider_response = await smm_manager_for_account(api_account).add_order(
+        service=int(service["provider_id"]),
+        link=link,
+        quantity=quantity,
+    )
+    provider_order_id = str(provider_response.get("order", "")).strip()
+    if not provider_order_id:
+        raise ValueError(f"استجابة غير صالحة من واجهة الطلبات: {provider_response}")
+    return provider_order_id
 
 
 async def _build_service_summary_for_state(
@@ -387,7 +498,7 @@ async def _send_order_link_step_prompt(
     subsection_key: str | None = None,
     service: dict,
 ) -> None:
-    link_prompt_text, allow_username = resolve_link_prompt(
+    link_prompt_text, allow_username, allow_free_text = resolve_link_prompt(
         platform_key,
         section_key,
         subsection_key,
@@ -400,6 +511,7 @@ async def _send_order_link_step_prompt(
     prompt = build_link_step_prompt(
         link_prompt_text,
         allow_username=allow_username,
+        allow_free_text=allow_free_text,
         step_label=step_label,
     )
     nav = build_flow_navigation_keyboard()
@@ -649,7 +761,6 @@ async def _show_platforms(
 
 ORDER_COMING_SOON_TEXT = "<b>قريباً</b>"
 
-
 async def _show_order_coming_soon(
     state: FSMContext,
     *,
@@ -693,10 +804,12 @@ async def _show_sections(
     await state.update_data(platform_key=platform_key, section_key=None, subsection_key=None, service_id=None, parent_section_key=None)
     title = category.get("title", "الخدمات")
     trail = _trail_from_order_context(platform_key)
-    short_body = f"<b>{title}</b>\nاختر التصنيف:"
-    full_text = _order_pre_service_full(short_body, *trail)
+    short_body = f"<b>{title}</b>\n\nاختر التصنيف:"
+    full_text = _order_pre_service_full(short_body, *trail, platform_key=platform_key)
     has_photo = await _living_has_photo(state, user_id)
-    text = _order_caption_text(full_text, short_body, *trail, has_photo=has_photo)
+    text = _order_caption_text(
+        full_text, short_body, *trail, has_photo=has_photo, platform_key=platform_key
+    )
     markup = build_sections_menu(platform_key)
     if use_edit:
         if await _edit_order_screen(bot, state, user_id, text, markup, message=message):
@@ -738,27 +851,86 @@ async def _show_services(
         subsection_key,
     )
     has_photo = await _living_has_photo(state, user_id)
+    subscription_notes_text = ""
+    split_subscription_notes = False
+    section_title = ""
     if is_direct:
         reply_markup = build_services_menu(platform_key, None, None)
         title = category.get("title", "الخدمات")
         await state.update_data(platform_key=platform_key, section_key=None)
         short_body = f"<b>{title}</b>\n\nاختر الخدمة:"
-        full_text = _order_pre_service_full(short_body, *trail)
-        text = _order_caption_text(full_text, short_body, *trail, has_photo=has_photo)
+        full_text = _order_pre_service_full(short_body, *trail, platform_key=platform_key)
+        text = _order_caption_text(
+            full_text, short_body, *trail, has_photo=has_photo, platform_key=platform_key
+        )
     else:
         section = category.get("sections", {}).get(section_key, {})
-        title = section.get("title", "القسم")
-        desc = resolve_section_notice(section)
+        section_title = section.get("title", "القسم")
+        desc = resolve_section_notice(section, platform_key=platform_key)
         reply_markup = build_services_menu(platform_key, section_key, subsection_key)
         await state.update_data(platform_key=platform_key, section_key=section_key)
-        if desc:
-            short_body = f"<b>{title}</b>\n\n{desc}\n\nاختر الخدمة:"
+        split_subscription_notes = (
+            platform_key == "subscriptions"
+            and bool(desc)
+            and has_photo
+        )
+        if split_subscription_notes:
+            short_body = _subscription_section_main_body(section_title, notes_above=True)
         else:
-            short_body = f"<b>{title}</b>\n\nاختر الخدمة:"
-        full_text = _order_pre_service_full(short_body, *trail)
-        text = _order_caption_text(full_text, short_body, *trail, has_photo=has_photo)
+            short_body = _subscription_section_living_body(
+                section_title, with_notes=bool(desc), desc=desc
+            )
+        full_text = _order_pre_service_full(short_body, *trail, platform_key=platform_key)
+        text = _order_caption_text(
+            full_text,
+            short_body,
+            *trail,
+            has_photo=has_photo,
+            platform_key=platform_key,
+        )
+        if split_subscription_notes:
+            subscription_notes_text = _order_pre_service_full(
+                f"<b>{section_title}</b>\n\n{desc}",
+                *trail,
+                platform_key=platform_key,
+            )
 
     await state.set_state(OrderFlow.choose_service)
+
+    if split_subscription_notes and subscription_notes_text:
+        chat_id = await _order_chat_id(state, user_id, message)
+        if chat_id is not None:
+            await _send_subscription_section_notes(
+                bot,
+                state,
+                chat_id,
+                subscription_notes_text,
+                persist_for_panel=section_key == "iptv_panel",
+            )
+            main_text = _order_pre_service_full(
+                _subscription_section_main_body(section_title, notes_above=True),
+                *trail,
+                platform_key=platform_key,
+            )
+            old_chat, old_id, _ = await get_living_ui(state, user_id)
+            if old_chat and old_id:
+                await strip_message_reply_markup(bot, old_chat, old_id)
+            try:
+                sent = await bot.send_message(
+                    chat_id=chat_id,
+                    text=main_text,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML",
+                )
+                await register_living_ui_message(state, sent, user_id=user_id)
+                await _sync_living_nav_anchor(bot, state, user_id, reply_markup)
+            except TelegramBadRequest:
+                if message is not None:
+                    await message.answer(
+                        main_text, reply_markup=reply_markup, parse_mode="HTML"
+                    )
+        return
+
     if use_edit:
         if await _edit_order_screen(
             bot, state, user_id, text, reply_markup, message=message
@@ -805,9 +977,15 @@ async def _show_subsections(
     trail = _trail_from_order_context(platform_key, section_key)
     preview = subsections_text if len(subsections_text) <= 500 else subsections_text[:497] + "…"
     short_body = f"<b>{title}</b>\nاختر النوع:\n{preview}"
-    full_text = _order_pre_service_full(f"<b>{title}</b>\nاختر النوع:\n{subsections_text}", *trail)
+    full_text = _order_pre_service_full(
+        f"<b>{title}</b>\nاختر النوع:\n{subsections_text}",
+        *trail,
+        platform_key=platform_key,
+    )
     has_photo = await _living_has_photo(state, user_id)
-    text = _order_caption_text(full_text, short_body, *trail, has_photo=has_photo)
+    text = _order_caption_text(
+        full_text, short_body, *trail, has_photo=has_photo, platform_key=platform_key
+    )
     markup = build_subsections_menu(platform_key, section_key)
     if use_edit:
         if await _edit_order_screen(bot, state, user_id, text, markup, message=message):
@@ -1128,7 +1306,7 @@ async def order_choose_service_callback(
 ) -> None:
     if not callback.from_user or not callback.message:
         return
-    user_id = await _prepare_order_nav(callback, state, bot, purge_transcript=True)
+    user_id = await _prepare_order_nav(callback, state, bot, purge_transcript=False)
     if user_id is None:
         return
     service_id = callback.data.split(":", maxsplit=2)[2]
@@ -1137,9 +1315,18 @@ async def order_choose_service_callback(
         await callback.answer("الخدمة غير موجودة", show_alert=True)
         return
     service, platform_key, section_key, subsection_key = located
+    if section_key != "iptv_panel":
+        await _clear_iptv_panel_notes_message(
+            bot, state, callback.message.chat.id
+        )
+        await purge_flow_transcript(
+            bot, state, user_id, callback.message.chat.id
+        )
     await _refresh_provider_limits_cache()
 
-    is_auto_interaction = service.get("auto_quantity") is not None
+    is_auto_interaction = (
+        service.get("auto_quantity") is not None and platform_key != "subscriptions"
+    )
     breadcrumb_line = _order_breadcrumb_line(
         *_trail_from_order_context(
             platform_key,
@@ -1182,7 +1369,8 @@ async def order_choose_service_callback(
 
     await state.set_state(OrderFlow.enter_link)
     section_key = section_key or None
-    await reset_flow_transcript(state)
+    if section_key != "iptv_panel":
+        await reset_flow_transcript(state)
     has_photo = await _living_has_photo(state, user_id)
     summary_text = await _build_service_summary_for_state(
         service,
@@ -1385,7 +1573,7 @@ async def order_enter_quantity_handler(message: Message, state: FSMContext, bot:
     await _sync_living_nav_anchor(bot, state, user_id, confirm_kb)
 
 
-@router.callback_query(F.data.in_({CB_ORDER_OTHER_SERVICES, CB_ORDER_SUBSCRIPTIONS}))
+@router.callback_query(F.data == CB_ORDER_OTHER_SERVICES)
 async def order_coming_soon_callback(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if not callback.from_user or not callback.message:
         return
@@ -1791,7 +1979,9 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         await callback.answer()
         return
 
-    if auto_qty is not None:
+    requires_admin = service_requires_admin(service)
+
+    if auto_qty is not None and not requires_admin:
         qty_ok, qty_error = await _auto_quantity_provider_check(service)
         if not qty_ok:
             await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
@@ -1858,15 +2048,28 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
 
     api_account = provider_creds["account_type"]
 
-    order_id = create_order_with_balance_hold(
-        user_id=user_id,
-        service_name=str(service["name"]),
-        service_id=str(service["id"]),
-        link=link,
-        quantity=quantity,
-        amount=to_float(total_price),
-        api_account=api_account,
-    )
+    if requires_admin:
+        order_id = create_order_with_balance_hold(
+            user_id=user_id,
+            service_name=str(service["name"]),
+            service_id=str(service["id"]),
+            link=link,
+            quantity=quantity,
+            amount=to_float(total_price),
+            api_account=api_account,
+            initial_status="pending_admin",
+            fulfillment_mode=FULFILLMENT_ADMIN,
+        )
+    else:
+        order_id = create_order_with_balance_hold(
+            user_id=user_id,
+            service_name=str(service["name"]),
+            service_id=str(service["id"]),
+            link=link,
+            quantity=quantity,
+            amount=to_float(total_price),
+            api_account=api_account,
+        )
     if not order_id:
         await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
         await _edit_order_result(
@@ -1883,15 +2086,16 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         return
 
     try:
-        provider_response = await smm_manager_for_account(api_account).add_order(
-            service=int(service["provider_id"]),
-            link=link,
-            quantity=quantity,
+        provider_order_id = await _submit_order_to_provider(
+            service,
+            link,
+            quantity,
+            api_account,
         )
-        provider_order_id = str(provider_response.get("order", "")).strip()
-        if not provider_order_id:
-            raise ValueError(f"استجابة غير صالحة من واجهة الطلبات: {provider_response}")
-        set_provider_order_id(order_id, provider_order_id)
+        if requires_admin:
+            assign_provider_order_id(order_id, provider_order_id)
+        else:
+            set_provider_order_id(order_id, provider_order_id)
     except RuntimeError as exc:
         error_text = str(exc).strip().lower()
         if "min_quantity" in error_text or "min quantity" in error_text:
@@ -1967,6 +2171,23 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         await callback.answer()
         return
 
+    if requires_admin:
+        user_record = get_user(user_id)
+        trail = _trail_from_order_context(platform_key, section_key, subsection_key)
+        order_type_label = " › ".join(trail) if trail else str(service["name"])
+        await notify_admin_new_manual_order(
+            bot,
+            order_id=order_id,
+            provider_order_id=provider_order_id,
+            user_id=user_id,
+            telegram_name=(user_record or {}).get("telegram_name"),
+            service_name=str(service["name"]),
+            order_type_label=order_type_label,
+            link=link,
+            quantity=quantity,
+            amount=to_float(total_price),
+        )
+
     success_bc = await _order_breadcrumb_from_state(
         state,
         service_name=str(service["name"]),
@@ -1979,6 +2200,7 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         quantity,
         format_amount_2(total_price),
         breadcrumb_line=success_bc,
+        admin_fulfillment=requires_admin,
     )
     success_nav = build_order_success_nav_keyboard()
     await _edit_order_result(callback, state, bot, user_id, receipt, success_nav)

@@ -265,6 +265,10 @@ def init_db() -> None:
             connection.execute(
                 "ALTER TABLE orders ADD COLUMN api_account TEXT NOT NULL DEFAULT 'default'"
             )
+        if "fulfillment_mode" not in order_columns:
+            connection.execute(
+                "ALTER TABLE orders ADD COLUMN fulfillment_mode TEXT NOT NULL DEFAULT 'auto'"
+            )
 
         connection.execute(
             """
@@ -368,6 +372,27 @@ def init_db() -> None:
             ON smm_services (is_active, platform_key)
             """
         )
+        smm_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(smm_services)").fetchall()
+        }
+        if "fulfillment_mode" not in smm_columns:
+            connection.execute(
+                "ALTER TABLE smm_services ADD COLUMN fulfillment_mode TEXT NOT NULL DEFAULT 'auto'"
+            )
+        connection.execute(
+            """
+            UPDATE smm_services
+            SET fulfillment_mode = 'admin'
+            WHERE platform_key = 'subscriptions'
+              AND COALESCE(fulfillment_mode, 'auto') = 'auto'
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_smm_services_fulfillment
+            ON smm_services (fulfillment_mode, platform_key)
+            """
+        )
 
         connection.execute(
             """
@@ -379,6 +404,39 @@ def init_db() -> None:
                 END
             """
         )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS timed_announcements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_html TEXT NOT NULL,
+                ends_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                launched_at TEXT,
+                stopped_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS timed_announcement_dismissals (
+                announcement_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                dismissed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (announcement_id, user_id),
+                FOREIGN KEY (announcement_id) REFERENCES timed_announcements(id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_timed_announcements_status_ends
+            ON timed_announcements (status, ends_at)
+            """
+        )
+
         connection.commit()
 
 
@@ -569,6 +627,8 @@ def create_order_with_balance_hold(
     amount: float,
     *,
     api_account: str = "default",
+    initial_status: str = "pending",
+    fulfillment_mode: str = "auto",
 ) -> int | None:
     amount_money = to_float(amount)
     with get_connection() as connection:
@@ -601,13 +661,17 @@ def create_order_with_balance_hold(
             return None
 
         account = str(api_account or "default").strip() or "default"
+        status = str(initial_status or "pending").strip() or "pending"
+        mode = str(fulfillment_mode or "auto").strip().lower() or "auto"
+        if mode not in {"auto", "admin"}:
+            mode = "auto"
         order_cursor = connection.execute(
             """
             INSERT INTO orders (
                 user_id, service_name, service_id, link, quantity, amount, total_price, status,
-                api_account
+                api_account, fulfillment_mode
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -617,7 +681,9 @@ def create_order_with_balance_hold(
                 quantity,
                 amount_money,
                 amount_money,
+                status,
                 account,
+                mode,
             ),
         )
         connection.commit()
@@ -940,6 +1006,36 @@ def set_provider_order_id(order_id: int, provider_order_id: str) -> bool:
         return cursor.rowcount > 0
 
 
+def assign_provider_order_id(order_id: int, provider_order_id: str) -> bool:
+    """Assign distributor order ref without changing order status."""
+    ref = str(provider_order_id or "").strip()
+    if not ref:
+        return False
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE orders
+            SET provider_order_id = ?
+            WHERE id = ?
+            """,
+            (ref, order_id),
+        )
+        connection.commit()
+        return cursor.rowcount > 0
+
+
+def get_order_id_by_provider_ref(provider_ref: str) -> int | None:
+    ref = str(provider_ref or "").strip().lstrip("#")
+    if not ref:
+        return None
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT id FROM orders WHERE provider_order_id = ?",
+            (ref,),
+        ).fetchone()
+    return int(row["id"]) if row else None
+
+
 def refund_order(order_id: int) -> bool:
     with get_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -1012,11 +1108,10 @@ def search_user_orders(user_id: int, query: str) -> list[OrderRecord]:
                 link = ?
                 OR LOWER(link) = LOWER(?)
                 OR provider_order_id = ?
-                OR CAST(id AS TEXT) = ?
               )
             ORDER BY id DESC
             """,
-            (user_id, needle, needle, normalized_ref, normalized_ref),
+            (user_id, needle, needle, normalized_ref),
         ).fetchall()
         return [_order_row_to_record(row) for row in rows]
 
@@ -1269,6 +1364,32 @@ def sum_revenue() -> float:
             """
         ).fetchone()
         return float(row["total"]) if row else 0.0
+
+
+def get_pending_admin_orders_ordered() -> list[OrderRecord]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
+                   start_count, created_at, status_note, api_account
+            FROM orders
+            WHERE LOWER(REPLACE(status, '_', ' ')) = 'pending admin'
+            ORDER BY id ASC
+            """,
+        ).fetchall()
+        return [_order_row_to_record(row) for row in rows]
+
+
+def count_pending_admin_orders() -> int:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM orders
+            WHERE LOWER(REPLACE(status, '_', ' ')) = 'pending admin'
+            """,
+        ).fetchone()
+    return int(row["count"]) if row else 0
 
 
 def get_trackable_orders(limit: int = 200) -> list[OrderRecord]:
@@ -2329,3 +2450,38 @@ def remove_pending_notification(user_id: int, message_id: int) -> None:
             (user_id, message_id),
         )
         connection.commit()
+
+
+def _expire_timed_announcements(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        UPDATE timed_announcements
+        SET status = 'expired'
+        WHERE status = 'active' AND ends_at <= datetime('now')
+        """
+    )
+
+
+def get_pending_timed_announcements_for_user(user_id: int) -> list[dict[str, object]]:
+    """All active, non-expired announcements — delivered on every /start."""
+    _ = user_id  # kept for call-site clarity
+    with get_connection() as connection:
+        _expire_timed_announcements(connection)
+        rows = connection.execute(
+            """
+            SELECT ta.id, ta.message_html, ta.ends_at
+            FROM timed_announcements ta
+            WHERE ta.status = 'active'
+              AND ta.ends_at > datetime('now')
+            ORDER BY ta.id ASC
+            """
+        ).fetchall()
+        connection.commit()
+    return [
+        {
+            "id": int(row["id"]),
+            "message_html": str(row["message_html"]),
+            "ends_at": str(row["ends_at"]),
+        }
+        for row in rows
+    ]

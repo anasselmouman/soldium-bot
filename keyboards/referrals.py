@@ -16,6 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from keyboards.nav_labels import BTN_BACK_STEP, BTN_MAIN_HOME, CB_MENU_HOME
 from keyboards.orders import build_flow_navigation_keyboard
+from config import PARTNERS_CHANNEL_LINK
 from services.referral import MAX_REFERRAL_LEVEL
 from utils.payment_banks import PAYMENT_METHODS, PaymentMethod
 
@@ -39,6 +40,11 @@ def build_referral_main_menu(*, referral_level: int) -> InlineKeyboardMarkup:
 
         builder.button(text="🚀 ترقية مستواي", callback_data="referral:upgrade")
 
+    builder.button(
+        text="روّج بسهولة (مواد جاهزة) ⚡",
+        url=PARTNERS_CHANNEL_LINK,
+    )
+
     builder.button(text="👥 المدعوين", callback_data="referral_list:0")
 
     builder.button(text="🔁 تحويل للرصيد", callback_data="referral:transfer")
@@ -49,11 +55,11 @@ def build_referral_main_menu(*, referral_level: int) -> InlineKeyboardMarkup:
 
     if referral_level < MAX_REFERRAL_LEVEL:
 
-        builder.adjust(1, 2, 1, 1)
+        builder.adjust(1, 1, 2, 1, 1)
 
     else:
 
-        builder.adjust(2, 1, 1)
+        builder.adjust(1, 2, 1, 1)
 
     return builder.as_markup()
 

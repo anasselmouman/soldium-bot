@@ -73,7 +73,8 @@ def build_subsections_preview(section: dict) -> str:
 def format_service_price_per_1000(service: dict, currency_display: str) -> str:
     price_clean = format_amount(service["price"])
     currency = currency_display.strip() or "DH"
-    return f"{price_clean} {currency} لكل 1000"
+    unit_label = "1" if service.get("price_per_unit") else "1000"
+    return f"{price_clean} {currency} لكل {unit_label}"
 
 
 def order_input_step_total(service: dict) -> int:
@@ -188,6 +189,7 @@ def build_link_step_prompt(
     link_prompt: str | None = None,
     *,
     allow_username: bool = False,
+    allow_free_text: bool = False,
     step_label: str = "الخطوة 1 من 2: الرابط",
 ) -> str:
     lines = [
@@ -195,7 +197,9 @@ def build_link_step_prompt(
         "",
         f"🔗 {_service_link_cta(link_prompt)}",
     ]
-    if allow_username:
+    if allow_free_text:
+        lines.append("اكتب أي نص تريده — مثال: اسمك أو دولتك.")
+    elif allow_username:
         lines.append(
             "يمكنك إرسال رابط عام أو معرف بصيغة <code>@username</code> إذا كان الحساب أو القناة عامة."
         )
@@ -526,6 +530,8 @@ def validate_platform_link(
         return False, _platform_mismatch_error(platform_key)
 
     sk = str(section_key or "").strip()
+    if platform_key == "subscriptions" and sk in {"iptv_wc2026", "iptv_panel"}:
+        return True, ""
     is_x_dm = platform_key == "x" and sk == "direct_messages"
 
     if not is_x_dm:

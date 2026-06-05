@@ -22,7 +22,10 @@ from database import (
 from services.order_provider_sync import apply_provider_status_to_order
 from utils.flow_transcript import (
     acknowledge_then_focus_living_ui,
+    delete_flow_step_prompt,
     flash_step_prompt_error,
+    get_flow_step_prompt_id,
+    purge_flow_transcript,
     reset_flow_transcript,
     send_flow_step_prompt,
     track_transcript_user_message,
@@ -34,8 +37,11 @@ from utils.home_screen import (
     send_onboarding_welcome_photo,
 )
 from utils.living_ui import (
+    delete_chat_message,
     edit_living_ui_message,
     edit_user_living_ui,
+    get_living_ui,
+    register_living_ui_ids,
     register_living_ui_message,
 )
 from keyboards.account import build_account_dashboard_markup, build_account_orders_markup
@@ -49,6 +55,7 @@ from services.referral import parse_referrer_id_from_start_payload
 from services.smm_api_router import smm_manager_for_account
 from smm_api import SMMManager
 from utils.telegram_ui import allow_new_message_fallback, safe_edit_message_text, send_finance_coming_soon_flash
+from utils.entry_delivery import deliver_post_entry_messages
 from utils.money import format_dh
 from utils.order_status_ar import (
     format_order_status_ar,
@@ -218,8 +225,155 @@ async def _build_my_orders_message_html(
     return "\n".join(lines)
 
 
+async def _is_account_search_flow_active(state: FSMContext) -> bool:
+    current = await state.get_state()
+    if current == AccountFlow.search_orders.state:
+        return True
+    step_id = await get_flow_step_prompt_id(state)
+    return step_id is not None
+
+
+async def _restore_account_orders_from_flow_back(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+) -> bool:
+    """الرجوع لقائمة الطلبات من مسار البحث — حذف السجل المؤقت وتحديث الواجهة الحية."""
+    if not callback.message or not callback.from_user:
+        return False
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    step_id = await get_flow_step_prompt_id(state)
+    living_chat, living_id, living_photo = await get_living_ui(state, user_id)
+    saved_living_id = living_id
+    living_corrupted = (
+        step_id is not None
+        and living_id is not None
+        and living_id == step_id
+    )
+    if living_corrupted:
+        living_chat, living_id = None, None
+
+    await delete_flow_step_prompt(bot, state, chat_id)
+    await clear_last_prompt(callback.message, state, bot=bot)
+    await purge_flow_transcript(bot, state, user_id, chat_id)
+    await state.clear()
+
+    add_user(user_id)
+    text = await _build_my_orders_message_html(user_id, bot, mode="latest")
+    markup = build_account_orders_markup(
+        show_all_button=count_user_orders(user_id) > 5,
+        include_search=True,
+    )
+
+    edited = False
+    if living_chat is not None and living_id is not None:
+        edited = await edit_user_living_ui(bot, state, user_id, text, markup)
+        if edited:
+            await register_living_ui_ids(
+                state, user_id, living_chat, living_id, has_photo=living_photo
+            )
+
+    if not edited:
+        if (
+            living_chat is not None
+            and saved_living_id is not None
+            and not living_corrupted
+        ):
+            await delete_chat_message(bot, living_chat, saved_living_id)
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+        await register_living_ui_ids(
+            state,
+            user_id,
+            sent.chat.id,
+            sent.message_id,
+            has_photo=bool(sent.photo),
+        )
+    return True
+
+
+async def _restore_account_dashboard_from_search_flow(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+) -> bool:
+    """تنظيف مسار البحث ثم عرض لوحة حسابي على الواجهة الحية."""
+    if not callback.message or not callback.from_user:
+        return False
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    step_id = await get_flow_step_prompt_id(state)
+    living_chat, living_id, living_photo = await get_living_ui(state, user_id)
+    saved_living_id = living_id
+    living_corrupted = (
+        step_id is not None
+        and living_id is not None
+        and living_id == step_id
+    )
+    if living_corrupted:
+        living_chat, living_id = None, None
+
+    await delete_flow_step_prompt(bot, state, chat_id)
+    await clear_last_prompt(callback.message, state, bot=bot)
+    await purge_flow_transcript(bot, state, user_id, chat_id)
+    await state.clear()
+
+    add_user(user_id, telegram_name=callback.from_user.full_name)
+    user = get_user(user_id)
+    if not user:
+        return False
+    display_name = (user.get("telegram_name") or "").strip() or (
+        callback.from_user.full_name or "مستخدم"
+    )
+    total_orders = count_user_orders(user_id)
+    text = _format_account_dashboard_html(
+        display_name=display_name,
+        user_id=user_id,
+        balance_dh=format_dh(user["balance"]),
+        spent_dh=format_dh(user["total_spent"]),
+        total_orders=total_orders,
+        is_partner=int(user.get("referral_level") or 1) >= 4,
+    )
+    markup = build_account_dashboard_markup()
+
+    edited = False
+    if living_chat is not None and living_id is not None:
+        edited = await edit_user_living_ui(bot, state, user_id, text, markup)
+        if edited:
+            await register_living_ui_ids(
+                state, user_id, living_chat, living_id, has_photo=living_photo
+            )
+
+    if not edited:
+        if (
+            living_chat is not None
+            and saved_living_id is not None
+            and not living_corrupted
+        ):
+            await delete_chat_message(bot, living_chat, saved_living_id)
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+        await register_living_ui_ids(
+            state,
+            user_id,
+            sent.chat.id,
+            sent.message_id,
+            has_photo=bool(sent.photo),
+        )
+    return True
+
+
 @router.message(CommandStart())
-async def start_handler(message: Message, state: FSMContext, command: CommandObject) -> None:
+async def start_handler(message: Message, state: FSMContext, command: CommandObject, bot: Bot) -> None:
     if not message.from_user:
         return
     ref_id = parse_referrer_id_from_start_payload(command.args)
@@ -233,26 +387,29 @@ async def start_handler(message: Message, state: FSMContext, command: CommandObj
     await clear_last_prompt(message, state)
     await state.clear()
 
-    # الخطوة 1: ترحيب سينمائي بدون أزرار (يُبقى في السجل)
     try:
-        await send_onboarding_welcome_photo(message)
-    except TelegramNetworkError:
-        logger.exception("Onboarding welcome step failed")
+        # الخطوة 1: ترحيب سينمائي بدون أزرار (يُبقى في السجل)
+        try:
+            await send_onboarding_welcome_photo(message)
+        except TelegramNetworkError:
+            logger.exception("Onboarding welcome step failed")
 
-    # الخطوة 2: انتظار قصير قبل ظهور الأزرار
-    await asyncio.sleep(2.5)
+        # الخطوة 2: انتظار قصير قبل ظهور الأزرار
+        await asyncio.sleep(2.5)
 
-    # الخطوة 3: لوحة الرئيسية الحية (صورة + أزرار)
-    try:
-        sent = await send_main_home_photo(
-            message,
-            message.from_user.id,
-            is_admin=message.from_user.id == ADMIN_ID,
-        )
-        if sent:
-            await register_living_ui_message(state, sent, user_id=message.from_user.id)
-    except TelegramNetworkError:
-        logger.exception("Failed to send main dashboard photo (network/timeout)")
+        # الخطوة 3: لوحة الرئيسية الحية (صورة + أزرار)
+        try:
+            sent = await send_main_home_photo(
+                message,
+                message.from_user.id,
+                is_admin=message.from_user.id == ADMIN_ID,
+            )
+            if sent:
+                await register_living_ui_message(state, sent, user_id=message.from_user.id)
+        except TelegramNetworkError:
+            logger.exception("Failed to send main dashboard photo (network/timeout)")
+    finally:
+        await deliver_post_entry_messages(bot, message.from_user.id)
 
 
 @router.callback_query(F.data == "menu:home")
@@ -283,6 +440,13 @@ async def home_menu_callback(callback: CallbackQuery, state: FSMContext, bot: Bo
 @router.callback_query(F.data == "menu:account")
 async def account_callback(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if not callback.from_user or not callback.message:
+        return
+    if await _is_account_search_flow_active(state):
+        restored = await _restore_account_dashboard_from_search_flow(callback, state, bot)
+        if not restored:
+            await callback.answer("تعذر جلب البيانات", show_alert=True)
+            return
+        await callback.answer()
         return
     await clear_last_prompt(callback.message, state)
     await state.clear()
@@ -421,6 +585,10 @@ async def support_callback(callback: CallbackQuery, state: FSMContext, bot: Bot)
 async def account_my_orders_callback(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     """قائمة الطلبات من لوحة حسابي؛ زر الرجوع يعيد واجهة حسابي. يُقبل menu:my_orders لأزرار قديمة."""
     if not callback.from_user or not callback.message:
+        return
+    if await _is_account_search_flow_active(state):
+        await _restore_account_orders_from_flow_back(callback, state, bot)
+        await callback.answer()
         return
     await clear_last_prompt(callback.message, state)
     await state.clear()

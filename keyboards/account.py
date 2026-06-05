@@ -56,7 +56,8 @@ def build_account_orders_markup(*, show_all_button: bool = True, include_search:
 
         builder.button(text="🔎 البحث عن طلب", callback_data="account:orders:search")
 
-    builder.button(text=BTN_BACK, callback_data=CB_MENU_ACCOUNT)
+    back_callback = "account:orders" if not include_search else CB_MENU_ACCOUNT
+    builder.button(text=BTN_BACK, callback_data=back_callback)
 
     if show_all_button and include_search:
 

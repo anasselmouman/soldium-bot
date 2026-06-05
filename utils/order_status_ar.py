@@ -16,6 +16,7 @@ def format_order_status_ar(status: str) -> str:
         "partial": "🟡 مكتمل جزئياً مع استرداد",
         "refunded": "💰 مسترد",
         "failed": "❌ فشل التنفيذ",
+        "pending admin": "👤 بانتظار تنفيذ الإدارة",
     }
     return mapping.get(normalized, "🔄 قيد المعالجة")
 

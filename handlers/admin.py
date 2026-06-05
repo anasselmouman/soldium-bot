@@ -7,15 +7,19 @@ from aiogram.types import CallbackQuery, Message
 
 from config import ADMIN_ID
 from database import (
+    OrderRecord,
     WithdrawalRecord,
     add_user,
     approve_withdrawal_by_admin,
     count_orders,
+    count_pending_admin_orders,
     count_pending_deposits,
     count_pending_withdrawals,
     count_users,
     get_all_user_ids,
     get_last_orders,
+    get_order_id_by_provider_ref,
+    get_pending_admin_orders_ordered,
     get_pending_withdrawals_ordered,
     get_user,
     get_withdrawal,
@@ -25,8 +29,12 @@ from database import (
     get_method_withdrawal_ledger_summary,
     sum_revenue,
 )
-from utils.ui_branding import format_breadcrumb, screen_body
-from keyboards.admin import build_admin_menu, build_admin_withdrawal_actions
+from services.order_provider_sync import user_visible_order_ref
+from keyboards.admin import (
+    build_admin_manual_order_actions,
+    build_admin_menu,
+    build_admin_withdrawal_actions,
+)
 from utils.withdraw_details import format_withdraw_details_admin_lines, safe_withdraw_details
 from smm_api import SMMManager
 from utils.smart_notifications import send_smart_notification
@@ -72,6 +80,7 @@ async def stats_handler(callback: CallbackQuery) -> None:
         f"• الطلبات: <b>{count_orders()}</b>\n"
         f"• طلبات الشحن المعلقة: <b>{count_pending_deposits()}</b>\n"
         f"• طلبات السحب المعلقة: <b>{count_pending_withdrawals()}</b>\n"
+        f"• طلبات بانتظار الأدمن: <b>{count_pending_admin_orders()}</b>\n"
         f"• إجمالي الأرباح: <code>{format_dh(sum_revenue())}</code>"
     )
     await callback.answer()
@@ -111,8 +120,8 @@ async def edit_order_status_start(callback: CallbackQuery, state: FSMContext) ->
     await callback.message.answer(
         "<b>🛠 تعديل حالة طلب</b>\n"
         "أرسل بالشكل التالي:\n"
-        "<code>order_id,status</code>\n"
-        "مثال: <code>15,completed</code>"
+        "<code>رقم_الطلب,status</code>\n"
+        "مثال: <code>12345678,completed</code>"
     )
     await callback.answer()
 
@@ -123,13 +132,12 @@ async def edit_order_status_submit(message: Message, state: FSMContext) -> None:
         return
     text = (message.text or "").strip()
     if "," not in text:
-        await message.answer("⚠️ التنسيق غير صحيح. استخدم: order_id,status")
+        await message.answer("⚠️ التنسيق غير صحيح. استخدم: رقم_الطلب,status")
         return
-    order_id_text, status = [part.strip() for part in text.split(",", maxsplit=1)]
-    try:
-        order_id = int(order_id_text)
-    except ValueError:
-        await message.answer("⚠️ order_id يجب أن يكون رقمًا صحيحًا.")
+    order_ref_text, status = [part.strip() for part in text.split(",", maxsplit=1)]
+    order_id = get_order_id_by_provider_ref(order_ref_text)
+    if order_id is None:
+        await message.answer("⚠️ لم يُعثر على طلب بهذا الرقم.")
         return
     if not status:
         await message.answer("⚠️ الحالة لا يمكن أن تكون فارغة.")
@@ -145,7 +153,7 @@ async def edit_order_status_submit(message: Message, state: FSMContext) -> None:
         )
         return
     await message.answer(
-        f"<b>✅ تم تحديث الطلب #{order_id}</b>\nالحالة الجديدة: <b>{status}</b>",
+        f"<b>✅ تم تحديث الطلب #{escape(order_ref_text)}</b>\nالحالة الجديدة: <b>{status}</b>",
         reply_markup=build_admin_menu(),
     )
 
@@ -326,6 +334,198 @@ async def _render_admin_withdrawal_queue(
         parse_mode="HTML",
         reply_markup=build_admin_withdrawal_actions(withdrawal["id"]),
     )
+
+
+def _customer_contact_html(user_id: int, telegram_name: str | None) -> str:
+    display = str(telegram_name or "").strip()
+    if not display:
+        display = f"مستخدم {user_id}"
+    return f'<a href="tg://user?id={user_id}">{escape(display)}</a>'
+
+
+def _format_admin_manual_order_card(
+    order: OrderRecord,
+    *,
+    position: int,
+    total: int,
+) -> str:
+    user = get_user(order["user_id"])
+    telegram_name = str((user or {}).get("telegram_name") or "").strip()
+    lines = [
+        "<b>📋 طلبات بانتظار الأدمن</b>",
+        f"<i>({position} من {total})</i>",
+        "",
+        f"<b>طلب يدوي</b> <code>#{escape(user_visible_order_ref(order))}</code>",
+        f"• الخدمة: <b>{escape(str(order['service_name']))}</b>",
+        f"• العميل: {_customer_contact_html(order['user_id'], telegram_name or None)}",
+        f"• المعرف: <code>{order['user_id']}</code>",
+        f"• الرابط / البيانات: <code>{escape(str(order['link']))}</code>",
+        f"• الكمية: <code>{order['quantity']}</code>",
+        f"• المبلغ: <b>{format_dh(order['amount'])}</b>",
+        f"• تاريخ الطلب: <code>{escape(str(order.get('created_at') or '—'))}</code>",
+    ]
+    return "\n".join(lines)
+
+
+async def _render_admin_manual_order_queue(
+    message: Message,
+    *,
+    notice: str | None = None,
+) -> None:
+    pending = get_pending_admin_orders_ordered()
+    if not pending:
+        text = "<b>📋 طلبات بانتظار الأدمن</b>\n\nلا توجد طلبات معلّقة حالياً."
+        if notice:
+            text = f"{notice}\n\n{text}"
+        await message.edit_text(text, parse_mode="HTML", reply_markup=build_admin_menu())
+        return
+
+    order = pending[0]
+    card = _format_admin_manual_order_card(order, position=1, total=len(pending))
+    if notice:
+        card = f"{notice}\n\n{card}"
+    await message.edit_text(
+        card,
+        parse_mode="HTML",
+        reply_markup=build_admin_manual_order_actions(order["id"]),
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data == "admin:manual_orders")
+async def admin_manual_orders_start_handler(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    pending = get_pending_admin_orders_ordered()
+    if not pending:
+        await callback.message.answer(
+            "<b>📋 طلبات بانتظار الأدمن</b>\n\nلا توجد طلبات معلّقة حالياً.",
+            parse_mode="HTML",
+            reply_markup=build_admin_menu(),
+        )
+        await callback.answer()
+        return
+    order = pending[0]
+    await callback.message.answer(
+        _format_admin_manual_order_card(order, position=1, total=len(pending)),
+        parse_mode="HTML",
+        reply_markup=build_admin_manual_order_actions(order["id"]),
+        disable_web_page_preview=True,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:manual:complete:"))
+async def admin_manual_order_complete_handler(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    try:
+        order_id = int((callback.data or "").split(":")[-1])
+    except ValueError:
+        await callback.answer("طلب غير صالح", show_alert=True)
+        return
+
+    pending_by_id = {order["id"]: order for order in get_pending_admin_orders_ordered()}
+    order = pending_by_id.get(order_id)
+    if order is None:
+        await callback.answer("تمت معالجة هذا الطلب سابقاً", show_alert=True)
+        await _render_admin_manual_order_queue(callback.message)
+        return
+
+    user_id = int(order["user_id"])
+    ok = set_order_status_by_admin(order_id, "completed")
+    if not ok:
+        await callback.answer("تعذر إتمام الطلب", show_alert=True)
+        return
+    notify_warning: str | None = None
+    if user_id:
+        order_ref = escape(user_visible_order_ref(order))
+        try:
+            await send_smart_notification(
+                bot,
+                user_id,
+                (
+                    "<b>✅ SOLDIUM | تم تنفيذ طلبك</b>\n"
+                    f"تم تنفيذ الطلب <code>#{order_ref}</code> بنجاح.\n"
+                    "شكراً لثقتك بنا!"
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Manual order completion notification failed for user %s, order %s: %s",
+                user_id,
+                order_id,
+                exc,
+            )
+            notify_warning = "⚠️ تعذر إرسال إشعار للمستخدم."
+    notice = f"<b>✅ تم تنفيذ الطلب</b> <code>#{order_ref}</code>."
+    if notify_warning:
+        notice = f"{notice}\n{notify_warning}"
+    await _render_admin_manual_order_queue(callback.message, notice=notice)
+    await callback.answer("تم تنفيذ الطلب")
+
+
+@router.callback_query(F.data.startswith("admin:manual:reject:"))
+async def admin_manual_order_reject_handler(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    try:
+        order_id = int((callback.data or "").split(":")[-1])
+    except ValueError:
+        await callback.answer("طلب غير صالح", show_alert=True)
+        return
+
+    pending = get_pending_admin_orders_ordered()
+    pending_by_id = {order["id"]: order for order in pending}
+    order = pending_by_id.get(order_id)
+    if order is None:
+        await callback.answer("تمت معالجة هذا الطلب سابقاً", show_alert=True)
+        await _render_admin_manual_order_queue(callback.message)
+        return
+
+    ok = set_order_status_by_admin(order_id, "canceled")
+    if not ok:
+        await callback.answer("تعذر رفض الطلب", show_alert=True)
+        return
+
+    notify_warning: str | None = None
+    order_ref = escape(user_visible_order_ref(order))
+    try:
+        await send_smart_notification(
+            bot,
+            order["user_id"],
+            (
+                "<b>⚠️ SOLDIUM | تم رفض الطلب</b>\n"
+                f"تعذّر تنفيذ الطلب <code>#{order_ref}</code>.\n"
+                f"تم إرجاع <b>{format_dh(order['amount'])}</b> إلى رصيدك.\n"
+                "تواصل مع الدعم إذا احتجت مساعدة."
+            ),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Manual order rejection notification failed for user %s, order %s: %s",
+            order["user_id"],
+            order_id,
+            exc,
+        )
+        notify_warning = "⚠️ تعذر إرسال إشعار للمستخدم."
+    notice = (
+        f"<b>❌ تم رفض الطلب</b> <code>#{order_ref}</code> "
+        f"وإرجاع <b>{format_dh(order['amount'])}</b> للمستخدم <code>{order['user_id']}</code>."
+    )
+    if notify_warning:
+        notice = f"{notice}\n{notify_warning}"
+    await _render_admin_manual_order_queue(callback.message, notice=notice)
+    await callback.answer("تم رفض الطلب وإرجاع الرصيد", show_alert=True)
 
 
 @router.callback_query(F.data == "admin:withdrawals")

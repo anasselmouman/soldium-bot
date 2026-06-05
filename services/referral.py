@@ -28,6 +28,8 @@ PENDING_COMMISSION_STATUSES = (
 
     "pending",
 
+    "pending_admin",
+
     "submitted",
 
     "in progress",

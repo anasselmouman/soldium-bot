@@ -71,6 +71,16 @@ def api_key_for_account(account_type: str) -> str:
 # رابط الدعم الفني (محادثة تيليغرام)
 SUPPORT_LINK = os.environ.get("SUPPORT_LINK", "https://t.me/SoldiumSupport").strip()
 
+# رابط واتساب الدعم (0647503039 → 212647503039)
+WHATSAPP_SUPPORT_LINK = os.environ.get(
+    "WHATSAPP_SUPPORT_LINK", "https://wa.me/212647503039"
+).strip()
+
+# قناة مواد الترويج الجاهزة لشركاء الإحالة
+PARTNERS_CHANNEL_LINK = os.environ.get(
+    "PARTNERS_CHANNEL_LINK", "https://t.me/SoldiumPartners"
+).strip()
+
 # معرف المدير
 ADMIN_ID = _env_int("ADMIN_ID")
 
@@ -107,6 +117,11 @@ DEBUG_AGENT_LOGS = os.environ.get("DEBUG_AGENT_LOGS", "").strip().lower() in (
     "1",
     "true",
     "yes",
+)
+
+# تحويل سعر المزوّد (USD لكل وحدة) إلى درهم في خدمات الاشتراكات per_unit
+SERVICE_USD_TO_DH_MULTIPLIER = float(
+    os.environ.get("SERVICE_USD_TO_DH_MULTIPLIER", "14"),
 )
 
 # هامش الربح المستخدم عند تحديث أسعار services_config (للمرجعية فقط حالياً)
