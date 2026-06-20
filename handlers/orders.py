@@ -23,6 +23,7 @@ from keyboards.orders import (
     build_subsections_menu,
     build_services_menu,
     build_order_confirm_keyboard,
+    build_order_insufficient_balance_keyboard,
     build_order_success_nav_keyboard,
     build_platforms_menu,
     build_order_critical_points_markup,
@@ -58,6 +59,7 @@ from utils.order_flow import (
     build_service_summary_text_short,
     build_subsections_preview,
     format_order_breadcrumb,
+    format_order_flow_header,
     format_service_price_per_1000,
     order_input_step_total,
     parse_subsection_callback,
@@ -211,9 +213,23 @@ def _order_breadcrumb_line(*trail: str) -> str:
     return format_order_breadcrumb(*trail)
 
 
+def _user_balance_amount(user_id: int) -> float:
+    user = get_user(user_id)
+    return float((user or {}).get("balance") or 0.0)
+
+
+def _order_flow_header(user_id: int, *trail: str) -> str:
+    return format_order_flow_header(
+        _user_balance_amount(user_id),
+        CURRENCY_DISPLAY,
+        *trail,
+    )
+
+
 async def _order_breadcrumb_from_state(
     state: FSMContext,
     *,
+    user_id: int,
     service_name: str | None = None,
     step_label: str | None = None,
 ) -> str:
@@ -225,21 +241,31 @@ async def _order_breadcrumb_from_state(
         service_name=service_name,
         step_label=step_label,
     )
-    return _order_breadcrumb_line(*trail)
+    return _order_flow_header(user_id, *trail)
 
 
-def _order_pre_service_full(body: str, *trail: str, platform_key: str | None = None) -> str:
-    bc = _order_breadcrumb_line(*trail)
+def _order_pre_service_full(
+    body: str,
+    *trail: str,
+    platform_key: str | None = None,
+    user_id: int,
+) -> str:
+    header = _order_flow_header(user_id, *trail)
     if str(platform_key or "").strip() == "subscriptions":
-        return f"{bc}\n\n{body}"
-    return f"{bc}\n\n{ORDER_READ_WARNING}{GUIDANCE_TEXT}\n\n{body}"
+        return f"{header}\n\n{body}"
+    return f"{header}\n\n{ORDER_READ_WARNING}{GUIDANCE_TEXT}\n\n{body}"
 
 
-def _order_pre_service_short(body: str, *trail: str, platform_key: str | None = None) -> str:
-    bc = _order_breadcrumb_line(*trail)
+def _order_pre_service_short(
+    body: str,
+    *trail: str,
+    platform_key: str | None = None,
+    user_id: int,
+) -> str:
+    header = _order_flow_header(user_id, *trail)
     if str(platform_key or "").strip() == "subscriptions":
-        return f"{bc}\n\n{body}"
-    return f"{bc}\n\n{ORDER_READ_WARNING_SHORT}{body}"
+        return f"{header}\n\n{body}"
+    return f"{header}\n\n{ORDER_READ_WARNING_SHORT}{body}"
 
 
 def _order_caption_text(
@@ -248,11 +274,12 @@ def _order_caption_text(
     *trail: str,
     has_photo: bool = False,
     platform_key: str | None = None,
+    user_id: int,
 ) -> str:
     """على رسالة الصورة: تعليق قصير يبقى تحت حد 1024 حرف."""
     if has_photo:
         return (
-            f"{_order_pre_service_short(short_body, *trail, platform_key=platform_key)}"
+            f"{_order_pre_service_short(short_body, *trail, platform_key=platform_key, user_id=user_id)}"
             f"\n{_ORDER_PHOTO_FOOTER}"
         )
     return full_text
@@ -458,12 +485,14 @@ async def _build_service_summary_for_state(
     service: dict,
     state: FSMContext,
     *,
+    user_id: int,
     has_photo: bool,
 ) -> str:
     await _refresh_provider_limits_cache()
     mn, mx = await _effective_limits(service)
     intro_breadcrumb = await _order_breadcrumb_from_state(
         state,
+        user_id=user_id,
         service_name=str(service["name"]),
         step_label="تفاصيل الخدمة",
     )
@@ -749,9 +778,9 @@ async def _show_platforms(
     await state.update_data(platform_key=None, section_key=None, subsection_key=None, service_id=None, parent_section_key=None)
     markup = build_platforms_menu()
     short_body = "<b>اختر المنصة:</b>"
-    full_text = _order_pre_service_full(short_body)
+    full_text = _order_pre_service_full(short_body, user_id=user_id)
     has_photo = await _living_has_photo(state, user_id)
-    text = _order_caption_text(full_text, short_body, has_photo=has_photo)
+    text = _order_caption_text(full_text, short_body, has_photo=has_photo, user_id=user_id)
     if use_edit:
         if await _edit_order_screen(bot, state, user_id, text, markup, message=message):
             await _sync_living_nav_anchor(bot, state, user_id, markup)
@@ -771,13 +800,14 @@ async def _show_order_coming_soon(
 ) -> None:
     await state.set_state(OrderFlow.choose_category)
     markup = build_order_coming_soon_markup()
+    text = f"{_order_flow_header(user_id)}\n\n{ORDER_COMING_SOON_TEXT}"
     if use_edit:
         if await _edit_order_screen(
-            bot, state, user_id, ORDER_COMING_SOON_TEXT, markup, message=message
+            bot, state, user_id, text, markup, message=message
         ):
             await _sync_living_nav_anchor(bot, state, user_id, markup)
     elif message is not None:
-        await message.answer(ORDER_COMING_SOON_TEXT, reply_markup=markup, parse_mode="HTML")
+        await message.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
 async def _show_sections(
@@ -805,10 +835,17 @@ async def _show_sections(
     title = category.get("title", "الخدمات")
     trail = _trail_from_order_context(platform_key)
     short_body = f"<b>{title}</b>\n\nاختر التصنيف:"
-    full_text = _order_pre_service_full(short_body, *trail, platform_key=platform_key)
+    full_text = _order_pre_service_full(
+        short_body, *trail, platform_key=platform_key, user_id=user_id
+    )
     has_photo = await _living_has_photo(state, user_id)
     text = _order_caption_text(
-        full_text, short_body, *trail, has_photo=has_photo, platform_key=platform_key
+        full_text,
+        short_body,
+        *trail,
+        has_photo=has_photo,
+        platform_key=platform_key,
+        user_id=user_id,
     )
     markup = build_sections_menu(platform_key)
     if use_edit:
@@ -859,9 +896,16 @@ async def _show_services(
         title = category.get("title", "الخدمات")
         await state.update_data(platform_key=platform_key, section_key=None)
         short_body = f"<b>{title}</b>\n\nاختر الخدمة:"
-        full_text = _order_pre_service_full(short_body, *trail, platform_key=platform_key)
+        full_text = _order_pre_service_full(
+            short_body, *trail, platform_key=platform_key, user_id=user_id
+        )
         text = _order_caption_text(
-            full_text, short_body, *trail, has_photo=has_photo, platform_key=platform_key
+            full_text,
+            short_body,
+            *trail,
+            has_photo=has_photo,
+            platform_key=platform_key,
+            user_id=user_id,
         )
     else:
         section = category.get("sections", {}).get(section_key, {})
@@ -880,19 +924,23 @@ async def _show_services(
             short_body = _subscription_section_living_body(
                 section_title, with_notes=bool(desc), desc=desc
             )
-        full_text = _order_pre_service_full(short_body, *trail, platform_key=platform_key)
+        full_text = _order_pre_service_full(
+            short_body, *trail, platform_key=platform_key, user_id=user_id
+        )
         text = _order_caption_text(
             full_text,
             short_body,
             *trail,
             has_photo=has_photo,
             platform_key=platform_key,
+            user_id=user_id,
         )
         if split_subscription_notes:
             subscription_notes_text = _order_pre_service_full(
                 f"<b>{section_title}</b>\n\n{desc}",
                 *trail,
                 platform_key=platform_key,
+                user_id=user_id,
             )
 
     await state.set_state(OrderFlow.choose_service)
@@ -911,6 +959,7 @@ async def _show_services(
                 _subscription_section_main_body(section_title, notes_above=True),
                 *trail,
                 platform_key=platform_key,
+                user_id=user_id,
             )
             old_chat, old_id, _ = await get_living_ui(state, user_id)
             if old_chat and old_id:
@@ -981,10 +1030,16 @@ async def _show_subsections(
         f"<b>{title}</b>\nاختر النوع:\n{subsections_text}",
         *trail,
         platform_key=platform_key,
+        user_id=user_id,
     )
     has_photo = await _living_has_photo(state, user_id)
     text = _order_caption_text(
-        full_text, short_body, *trail, has_photo=has_photo, platform_key=platform_key
+        full_text,
+        short_body,
+        *trail,
+        has_photo=has_photo,
+        platform_key=platform_key,
+        user_id=user_id,
     )
     markup = build_subsections_menu(platform_key, section_key)
     if use_edit:
@@ -1017,7 +1072,7 @@ async def _edit_message_to_link_entry_prompt(
     subsection_key = subsection_key or None
     has_photo = await _living_has_photo(state, user_id)
     summary_text = await _build_service_summary_for_state(
-        service, state, has_photo=has_photo
+        service, state, user_id=user_id, has_photo=has_photo
     )
     await delete_flow_step_prompt(bot, state, chat_id)
     if await _edit_order_screen(
@@ -1053,7 +1108,11 @@ async def order_critical_points_callback(callback: CallbackQuery, state: FSMCont
     if not callback.from_user or not callback.message:
         return
     await _prepare_order_nav(callback, state, bot)
-    text = build_critical_points_html("الخدمات والأسعار")
+    text = build_critical_points_html(
+        "الخدمات والأسعار",
+        balance=_user_balance_amount(callback.from_user.id),
+        currency_display=CURRENCY_DISPLAY,
+    )
     markup = build_order_critical_points_markup()
     if await _edit_order_screen(
         bot,
@@ -1327,14 +1386,15 @@ async def order_choose_service_callback(
     is_auto_interaction = (
         service.get("auto_quantity") is not None and platform_key != "subscriptions"
     )
-    breadcrumb_line = _order_breadcrumb_line(
+    breadcrumb_line = _order_flow_header(
+        user_id,
         *_trail_from_order_context(
             platform_key,
             section_key,
             subsection_key,
             service_name=str(service["name"]),
             step_label="تنبيه الخدمة",
-        )
+        ),
     )
     if is_auto_interaction:
         disclaimer_text = (
@@ -1375,6 +1435,7 @@ async def order_choose_service_callback(
     summary_text = await _build_service_summary_for_state(
         service,
         state,
+        user_id=user_id,
         has_photo=has_photo,
     )
     edited = await _edit_order_screen(
@@ -1447,6 +1508,7 @@ async def order_enter_link_handler(message: Message, state: FSMContext, bot: Bot
         await state.set_state(OrderFlow.confirm_order)
         confirm_bc = await _order_breadcrumb_from_state(
             state,
+            user_id=user_id,
             service_name=str(service["name"]),
             step_label="تأكيد الطلب",
         )
@@ -1542,6 +1604,7 @@ async def order_enter_quantity_handler(message: Message, state: FSMContext, bot:
     await state.set_state(OrderFlow.confirm_order)
     confirm_bc = await _order_breadcrumb_from_state(
         state,
+        user_id=user_id,
         service_name=str(service["name"]),
         step_label="تأكيد الطلب",
     )
@@ -1691,6 +1754,7 @@ async def _handle_back_navigation(callback: CallbackQuery, state: FSMContext, bo
             summary_text = await _build_service_summary_for_state(
                 service,
                 state,
+                user_id=user_id,
                 has_photo=has_photo,
             )
             await delete_flow_step_prompt(bot, state, chat_id)
@@ -1856,6 +1920,7 @@ async def auto_disclaimer_accept_callback(callback: CallbackQuery, state: FSMCon
     summary_text = await _build_service_summary_for_state(
         service,
         state,
+        user_id=user_id,
         has_photo=has_photo,
     )
     if await _edit_order_screen(
@@ -2071,16 +2136,21 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
             api_account=api_account,
         )
     if not order_id:
-        await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+        header = await _order_breadcrumb_from_state(
+            state,
+            user_id=user_id,
+            service_name=str(service["name"]),
+            step_label="تأكيد الطلب",
+        )
         await _edit_order_result(
             callback,
             state,
             bot,
             user_id,
+            f"{header}\n\n"
             f"<b>الرصيد غير كافٍ لإكمال الطلب.</b>\n"
-            f"المبلغ المطلوب: <b>{format_amount_2(total_price)} {CURRENCY_DISPLAY}</b>\n"
-            "أضف رصيدك ثم أعد إنشاء الطلب.",
-            _home(user_id),
+            f"المبلغ المطلوب: <b>{format_amount_2(total_price)} {CURRENCY_DISPLAY}</b>",
+            build_order_insufficient_balance_keyboard(),
         )
         await callback.answer()
         return
@@ -2190,6 +2260,7 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
 
     success_bc = await _order_breadcrumb_from_state(
         state,
+        user_id=user_id,
         service_name=str(service["name"]),
         step_label="تم الطلب",
     )

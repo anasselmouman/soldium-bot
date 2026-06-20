@@ -31,6 +31,15 @@ def _critical_points_paragraphs() -> tuple[str, ...]:
     )
 
 
-def build_critical_points_html(*breadcrumb_prefix: str) -> str:
+def build_critical_points_html(
+    *breadcrumb_prefix: str,
+    balance: object | None = None,
+    currency_display: str = "DH",
+) -> str:
     trail = breadcrumb_prefix + ("اقرأ قبل الشراء",) if breadcrumb_prefix else ("اقرأ قبل الشراء",)
-    return screen_body(format_breadcrumb(*trail), *_critical_points_paragraphs())
+    bc = format_breadcrumb(*trail)
+    if balance is not None:
+        from utils.order_flow import format_order_balance_line
+
+        bc = f"{bc}\n{format_order_balance_line(balance, currency_display)}"
+    return screen_body(bc, *_critical_points_paragraphs())

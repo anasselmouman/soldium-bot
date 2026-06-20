@@ -48,6 +48,16 @@ def build_order_success_nav_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def build_order_insufficient_balance_keyboard() -> InlineKeyboardMarkup:
+    """خيارات عند عدم كفاية الرصيد بعد تأكيد الطلب."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 إضافة رصيد", callback_data="menu:deposit")
+    builder.button(text=BTN_MAIN_HOME, callback_data=CB_MENU_HOME)
+    builder.button(text=BTN_BACK_STEP, callback_data="order:nav:back")
+    builder.adjust(1, 2)
+    return builder.as_markup()
+
+
 def build_order_confirm_keyboard(
     confirm_callback: str = "order:confirm:yes",
     cancel_callback: str = "order:nav:back",

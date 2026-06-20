@@ -73,7 +73,10 @@ def _item_from_row(row: sqlite3.Row) -> dict[str, Any]:
         item["price_per_unit"] = True
         item["auto_quantity"] = 1
         provider_usd = float(row["provider_price_usd"] or 0)
-        if provider_usd > 0:
+        local_dh = float(row["local_price_dh"] or 0)
+        if local_dh > 0:
+            item["price"] = local_dh
+        elif provider_usd > 0:
             item["price"] = round(provider_usd * SERVICE_USD_TO_DH_MULTIPLIER, 2)
     row_keys = row.keys()
     fulfillment_mode = "auto"
@@ -112,8 +115,80 @@ def _ensure_section(platform: dict[str, Any], row: sqlite3.Row) -> dict[str, Any
 
 
 PLATFORM_SECTION_ORDER: dict[str, list[str]] = {
-    "instagram": ["followers", "views", "likes", "interaction"],
+    "instagram": ["likes", "views", "followers", "interaction"],
+    "facebook": ["reactions", "video_reels_views", "followers_members", "live_stream_views"],
+    "tiktok": ["likes", "views", "followers"],
+    "telegram": [
+        "post_interactions",
+        "post_views",
+        "channel_members",
+        "post_share",
+        "start_bot",
+        "automatic_interactions",
+    ],
 }
+
+# عناوين عرض الأقسام (إيموجي في البداية والنهاية) — تُطبَّق فوق قاعدة البيانات.
+PLATFORM_SECTION_TITLES: dict[str, dict[str, str]] = {
+    "telegram": {
+        "post_interactions": "⚡ تفاعلات المنشورات 👍❤️🔥 ⚡",
+        "post_views": "👁️ مشاهدة منشور 👁️",
+        "channel_members": "👥 أعضاء القنوات والمجموعات 👥",
+        "post_share": "📤 مشاركة المنشور (Share) 📤",
+        "start_bot": "🤖 بدء البوت (Start Bot) 🤖",
+        "automatic_interactions": "🔄 تفاعلات تلقائية للمنشورات القادمة 🔄",
+    },
+}
+
+PLATFORM_SUBSECTION_TITLES: dict[str, dict[tuple[str, str], str]] = {
+    "telegram": {
+        ("channel_members", "global_members"): "👥 أعضاء عالمي (اقتصادي/عالي الجودة) 👥",
+        ("channel_members", "targeted_members"): "🌍 أعضاء مستهدفين (دول) 🌍",
+        ("channel_members", "premium_members"): "⭐ أعضاء بريميوم (لدعم الرانك) ⭐",
+        ("channel_members", "member_bundles"): "📦 باقات متكاملة (أعضاء + مشاهدات) 📦",
+        ("channel_members", "arab_mix_members"): "🇲🇦 أعضاء عرب (Mix) 🇲🇦",
+        ("post_views", "past_posts"): "🔙 منشورات سابقة (Auto) 🔙",
+        ("post_views", "future_posts"): "🔮 منشورات قادمة (Future) 🔮",
+        ("post_views", "premium_views"): "🌟 مشاهدات بريميوم (تلقائية) 🌟",
+        ("post_interactions", "normal_interactions"): "⚡ تفاعلات حسابات عادية (الفورية) ⚡",
+        ("post_interactions", "premium_interactions"): "🌟 تفاعلات حسابات بريميوم (الفورية) 🌟",
+        ("post_interactions", "automatic_interactions"): "🔄 تفاعلات تلقائية للمنشورات القادمة 🔄",
+        ("automatic_interactions", "positive_mix"): "✨ ميكس تفاعلات إيجابي (👍❤️🔥🥰👏🎉💯) ✨",
+        ("automatic_interactions", "negative_mix"): "💀 ميكس تفاعلات سلبي (👎💔🤨🙄🤬🖕💩🤡🤮) 💀",
+        ("automatic_interactions", "specific_emoji"): "🎯 تفاعل محدد (إيموجي واحد) 🎯",
+    },
+}
+
+# أقسام فرعية فارغة تُوجّه لقسم آخر — لا تُخزَّن في smm_services.
+TELEGRAM_REDIRECT_SUBSECTIONS: dict[str, dict[str, dict[str, Any]]] = {
+    "post_interactions": {
+        "automatic_interactions": {
+            "redirect_section": "automatic_interactions",
+        },
+    },
+}
+
+SERVICE_ITEM_META_KEYS: tuple[str, ...] = (
+    "auto_quantity",
+    "note",
+    "link_prompt_key",
+    "notice_key",
+)
+SECTION_META_KEYS: tuple[str, ...] = ("section_notice_key", "note")
+SUBSECTION_META_KEYS: tuple[str, ...] = ("note",)
+
+_embedded_indexes_cache: tuple[
+    dict[str, dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str, str], dict[str, Any]],
+    list[tuple[str, str, str, dict[str, Any]]],
+] | None = None
+
+TELEGRAM_POST_INTERACTIONS_SUBSECTION_ORDER: list[str] = [
+    "normal_interactions",
+    "premium_interactions",
+    "automatic_interactions",
+]
 
 # ترتيب ثانوي للعناصر بنفس السعر (مثلاً استهداف جغرافي في المشاهدات).
 SECTION_ITEM_ORDER: dict[tuple[str, str], list[str]] = {
@@ -197,12 +272,32 @@ def _reorder_platform_sections(platform_key: str, platform: dict[str, Any]) -> N
     platform["sections"] = ordered
 
 
+def _apply_platform_display_titles(platform_key: str, platform: dict[str, Any]) -> None:
+    section_titles = PLATFORM_SECTION_TITLES.get(platform_key) or {}
+    subsection_titles = PLATFORM_SUBSECTION_TITLES.get(platform_key) or {}
+    sections = platform.get("sections") or {}
+    for section_key, section in sections.items():
+        if not isinstance(section, dict):
+            continue
+        title = section_titles.get(str(section_key))
+        if title:
+            section["title"] = title
+        for subsection_key, subsection in (section.get("subsections") or {}).items():
+            if not isinstance(subsection, dict):
+                continue
+            sub_title = subsection_titles.get((str(section_key), str(subsection_key)))
+            if sub_title:
+                subsection["title"] = sub_title
+
+
 def _sort_services_catalog(services: dict[str, Any]) -> None:
     for platform_key, platform in services.items():
         if not isinstance(platform, dict):
             continue
-        _reorder_platform_sections(str(platform_key), platform)
-        _sort_platform_catalog(str(platform_key), platform)
+        pk = str(platform_key)
+        _reorder_platform_sections(pk, platform)
+        _apply_platform_display_titles(pk, platform)
+        _sort_platform_catalog(pk, platform)
 
 
 SUBSCRIPTIONS_PLATFORM: dict[str, Any] = {
@@ -235,6 +330,284 @@ def _sort_iptv_wc2026_items(services: dict[str, Any]) -> None:
     _sort_subscription_section_items(services, "iptv_wc2026")
 
 
+def _section_has_catalog_items(section: dict[str, Any]) -> bool:
+    if section.get("items"):
+        return True
+    for subsection in (section.get("subsections") or {}).values():
+        if isinstance(subsection, dict) and subsection.get("items"):
+            return True
+    return False
+
+
+def _reorder_named_subsections(section: dict[str, Any], order: list[str]) -> None:
+    subsections = section.get("subsections") or {}
+    if not subsections:
+        return
+    ordered: dict[str, Any] = {}
+    for key in order:
+        if key in subsections:
+            ordered[key] = subsections[key]
+    for key, value in subsections.items():
+        if key not in ordered:
+            ordered[key] = value
+    section["subsections"] = ordered
+
+
+def _embedded_services_source() -> dict[str, Any]:
+    try:
+        from services_config_embedded import SERVICES
+
+        return SERVICES
+    except Exception as exc:
+        logger.debug("Embedded catalog unavailable for metadata merge: %s", exc)
+        return {}
+
+
+def _service_index_keys(item: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    for field in ("provider_id", "id"):
+        value = item.get(field)
+        if value is not None and str(value).strip():
+            keys.append(str(value).strip())
+    return keys
+
+
+def _pick_meta(source: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    return {key: source[key] for key in fields if source.get(key) is not None}
+
+
+def _merge_missing_fields(target: dict[str, Any], meta: dict[str, Any]) -> None:
+    for key, value in meta.items():
+        if target.get(key) is None:
+            target[key] = value
+
+
+def _build_embedded_metadata_indexes(
+    embedded: dict[str, Any],
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str, str], dict[str, Any]],
+    list[tuple[str, str, str, dict[str, Any]]],
+]:
+    service_meta: dict[str, dict[str, Any]] = {}
+    section_meta: dict[tuple[str, str], dict[str, Any]] = {}
+    subsection_meta: dict[tuple[str, str, str], dict[str, Any]] = {}
+    redirect_links: list[tuple[str, str, str, dict[str, Any]]] = []
+
+    def _index_service_item(item: dict[str, Any]) -> None:
+        meta = _pick_meta(item, SERVICE_ITEM_META_KEYS)
+        if not meta:
+            return
+        for key in _service_index_keys(item):
+            bucket = service_meta.setdefault(key, {})
+            for field, value in meta.items():
+                bucket.setdefault(field, value)
+
+    for platform_key, category in embedded.items():
+        if not isinstance(category, dict):
+            continue
+        pk = str(platform_key)
+        for item in category.get("items") or []:
+            if isinstance(item, dict):
+                _index_service_item(item)
+        for item in category.get("direct_items") or []:
+            if isinstance(item, dict):
+                _index_service_item(item)
+
+        for section_key, section in (category.get("sections") or {}).items():
+            if not isinstance(section, dict):
+                continue
+            sk = str(section_key)
+            sec_meta = _pick_meta(section, SECTION_META_KEYS)
+            if sec_meta:
+                bucket = section_meta.setdefault((pk, sk), {})
+                for field, value in sec_meta.items():
+                    bucket.setdefault(field, value)
+
+            for item in section.get("items") or []:
+                if isinstance(item, dict):
+                    _index_service_item(item)
+
+            for subsection_key, subsection in (section.get("subsections") or {}).items():
+                if not isinstance(subsection, dict):
+                    continue
+                ssk = str(subsection_key)
+                sub_meta = _pick_meta(subsection, SUBSECTION_META_KEYS)
+                if sub_meta:
+                    bucket = subsection_meta.setdefault((pk, sk, ssk), {})
+                    for field, value in sub_meta.items():
+                        bucket.setdefault(field, value)
+
+                redirect_target = str(subsection.get("redirect_section") or "").strip()
+                if redirect_target and not subsection.get("items"):
+                    redirect_links.append(
+                        (
+                            pk,
+                            sk,
+                            ssk,
+                            {
+                                "redirect_section": redirect_target,
+                                "title": str(subsection.get("title") or ssk),
+                            },
+                        )
+                    )
+
+                for item in subsection.get("items") or []:
+                    if isinstance(item, dict):
+                        _index_service_item(item)
+
+    return service_meta, section_meta, subsection_meta, redirect_links
+
+
+def _get_embedded_metadata_indexes() -> tuple[
+    dict[str, dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str, str], dict[str, Any]],
+    list[tuple[str, str, str, dict[str, Any]]],
+]:
+    global _embedded_indexes_cache
+    if _embedded_indexes_cache is None:
+        _embedded_indexes_cache = _build_embedded_metadata_indexes(_embedded_services_source())
+    return _embedded_indexes_cache
+
+
+def _infer_auto_quantity(
+    item: dict[str, Any],
+    *,
+    section_key: str | None,
+) -> None:
+    if item.get("auto_quantity") is not None:
+        return
+    sk = str(section_key or "").strip()
+    if sk != "automatic_interactions":
+        return
+    min_qty = int(item.get("min") or 0)
+    max_qty = int(item.get("max") or 0)
+    if min_qty > 0 and min_qty == max_qty:
+        item["auto_quantity"] = min_qty
+
+
+def _apply_redirect_subsections(
+    services: dict[str, Any],
+    redirect_links: list[tuple[str, str, str, dict[str, Any]]],
+) -> None:
+    subsection_titles = PLATFORM_SUBSECTION_TITLES.get("telegram") or {}
+    for platform_key, parent_section_key, subsection_key, meta in redirect_links:
+        platform = services.get(platform_key)
+        if not isinstance(platform, dict):
+            continue
+        sections = platform.get("sections") or {}
+        redirect_target = str(meta.get("redirect_section") or "").strip()
+        target_section = sections.get(redirect_target)
+        if not redirect_target or not isinstance(target_section, dict):
+            continue
+        if not _section_has_catalog_items(target_section):
+            continue
+
+        parent_section = sections.setdefault(
+            parent_section_key,
+            {"title": parent_section_key, "items": [], "subsections": {}},
+        )
+        subsections = parent_section.setdefault("subsections", {})
+        title = str(
+            meta.get("title")
+            or subsection_titles.get((parent_section_key, subsection_key), subsection_key)
+        )
+        existing = subsections.get(subsection_key)
+        if isinstance(existing, dict):
+            if not existing.get("redirect_section") and not existing.get("items"):
+                existing["redirect_section"] = redirect_target
+            if not existing.get("title"):
+                existing["title"] = title
+            continue
+        subsections[subsection_key] = {
+            "title": title,
+            "redirect_section": redirect_target,
+            "items": [],
+        }
+
+
+def _telegram_static_redirect_links() -> list[tuple[str, str, str, dict[str, Any]]]:
+    subsection_titles = PLATFORM_SUBSECTION_TITLES.get("telegram") or {}
+    links: list[tuple[str, str, str, dict[str, Any]]] = []
+    for parent_sk, subs in TELEGRAM_REDIRECT_SUBSECTIONS.items():
+        for sub_sk, meta in subs.items():
+            links.append(
+                (
+                    "telegram",
+                    parent_sk,
+                    sub_sk,
+                    {
+                        "redirect_section": str(meta.get("redirect_section") or ""),
+                        "title": subsection_titles.get((parent_sk, sub_sk), sub_sk),
+                    },
+                )
+            )
+    return links
+
+
+def _merge_catalog_metadata_from_embedded(services: dict[str, Any]) -> None:
+    """يُكمّل metadata غير المخزّن في smm_services (تنويهات، redirect، auto_quantity…)."""
+    (
+        service_meta,
+        section_meta,
+        subsection_meta,
+        redirect_links,
+    ) = _get_embedded_metadata_indexes()
+
+    for platform_key, category in services.items():
+        if not isinstance(category, dict):
+            continue
+        pk = str(platform_key)
+
+        def _enrich_item(item: dict[str, Any], section_key: str | None) -> None:
+            for key in _service_index_keys(item):
+                meta = service_meta.get(key)
+                if meta:
+                    _merge_missing_fields(item, meta)
+            _infer_auto_quantity(item, section_key=section_key)
+
+        for item in category.get("items") or []:
+            if isinstance(item, dict):
+                _enrich_item(item, None)
+        for item in category.get("direct_items") or []:
+            if isinstance(item, dict):
+                _enrich_item(item, "direct")
+
+        for section_key, section in (category.get("sections") or {}).items():
+            if not isinstance(section, dict):
+                continue
+            sk = str(section_key)
+            sec_extra = section_meta.get((pk, sk))
+            if sec_extra:
+                _merge_missing_fields(section, sec_extra)
+
+            for item in section.get("items") or []:
+                if isinstance(item, dict):
+                    _enrich_item(item, sk)
+
+            for subsection_key, subsection in (section.get("subsections") or {}).items():
+                if not isinstance(subsection, dict):
+                    continue
+                ssk = str(subsection_key)
+                sub_extra = subsection_meta.get((pk, sk, ssk))
+                if sub_extra:
+                    _merge_missing_fields(subsection, sub_extra)
+                for item in subsection.get("items") or []:
+                    if isinstance(item, dict):
+                        _enrich_item(item, sk)
+
+    _apply_redirect_subsections(services, redirect_links)
+    _apply_redirect_subsections(services, _telegram_static_redirect_links())
+
+    telegram = services.get("telegram")
+    if isinstance(telegram, dict):
+        post_section = (telegram.get("sections") or {}).get("post_interactions")
+        if isinstance(post_section, dict):
+            _reorder_named_subsections(post_section, TELEGRAM_POST_INTERACTIONS_SUBSECTION_ORDER)
+
+
 def _merge_subscriptions_platform(services: dict[str, Any]) -> None:
     """دمج تصنيفات الإشتراكات الثابتة مع ما يُحمَّل من قاعدة البيانات."""
     existing = services.get("subscriptions")
@@ -260,6 +633,7 @@ def build_services_dict_from_db() -> dict[str, Any]:
     if not rows:
         services = _fallback_embedded()
         _merge_subscriptions_platform(services)
+        _merge_catalog_metadata_from_embedded(services)
         _sort_iptv_wc2026_items(services)
         _sort_subscription_section_items(services, "iptv_panel")
         _sort_services_catalog(services)
@@ -295,6 +669,7 @@ def build_services_dict_from_db() -> dict[str, Any]:
             subsections[sub_key]["items"].append(item)
 
     _merge_subscriptions_platform(services)
+    _merge_catalog_metadata_from_embedded(services)
     _sort_iptv_wc2026_items(services)
     _sort_subscription_section_items(services, "iptv_panel")
     _sort_services_catalog(services)

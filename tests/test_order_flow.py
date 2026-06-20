@@ -244,7 +244,9 @@ def test_build_summary_text_short_shows_full_bullet_notes():
 def test_build_link_step_prompt_requests_link():
     text = build_link_step_prompt()
     assert "الرابط" in text
-    assert "http://" in text or "https://" in text
+    assert "أرسل رابط الحساب أو المنشور الذي تريد تنفيذ الطلب عليه:" in text
+    assert "http://" not in text
+    assert "https://" not in text
 
 
 def test_build_intro_text_strips_trailing_price_zeros():

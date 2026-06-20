@@ -17,10 +17,22 @@ def format_order_breadcrumb(*trail: str) -> str:
     return format_breadcrumb(ORDER_FLOW_ROOT, *trail)
 
 
+def format_order_balance_line(balance: object, currency_display: str) -> str:
+    return f"الرصيد: <b>{format_amount_2(balance)} {currency_display}</b>"
+
+
+def format_order_flow_header(balance: object, currency_display: str, *trail: str) -> str:
+    """مسار الخدمات والأسعار مع سطر الرصيد تحته مباشرة."""
+    return (
+        f"{format_order_breadcrumb(*trail)}\n"
+        f"{format_order_balance_line(balance, currency_display)}"
+    )
+
+
 def with_order_breadcrumb(body: str, *trail: str) -> str:
     return f"{format_order_breadcrumb(*trail)}\n\n{body}"
 
-DEFAULT_SERVICE_LINK_CTA = "أرسل رابط الحساب أو المنشور الذي تريد تنفيذ الطلب عليه."
+DEFAULT_SERVICE_LINK_CTA = "أرسل رابط الحساب أو المنشور الذي تريد تنفيذ الطلب عليه:"
 
 
 PLATFORM_HOST_RULES: dict[str, tuple[str, ...]] = {
@@ -118,6 +130,13 @@ def build_quantity_limits_text(min_quantity: int, max_quantity: int) -> str:
     )
 
 
+def build_quantity_limits_compact_text(min_quantity: int, max_quantity: int) -> str:
+    return (
+        f"الحد الأدنى: <b>{min_quantity}</b>\n"
+        f"الحد الأقصى: <b>{max_quantity}</b>"
+    )
+
+
 def _service_link_cta(link_prompt: str | None) -> str:
     text = (link_prompt or "").strip() or DEFAULT_SERVICE_LINK_CTA
     return f"🔗 {text}"
@@ -195,7 +214,7 @@ def build_link_step_prompt(
     lines = [
         f"<b>{step_label}</b>",
         "",
-        f"🔗 {_service_link_cta(link_prompt)}",
+        _service_link_cta(link_prompt),
     ]
     if allow_free_text:
         lines.append("اكتب أي نص تريده — مثال: اسمك أو دولتك.")
@@ -203,8 +222,6 @@ def build_link_step_prompt(
         lines.append(
             "يمكنك إرسال رابط عام أو معرف بصيغة <code>@username</code> إذا كان الحساب أو القناة عامة."
         )
-    else:
-        lines.append("أرسل الرابط كاملاً، ويجب أن يبدأ بـ <code>http://</code> أو <code>https://</code>.")
     return "\n".join(lines)
 
 
@@ -225,8 +242,7 @@ def build_quantity_step_prompt(
         f"<b>{step_label}</b>\n\n"
         f"• الخدمة: <b>{escape(str(service['name']))}</b>\n"
         f"• الرابط المحفوظ: <code>{escape(link_short)}</code>\n\n"
-        "<b>الحدود المسموحة لهذه الخدمة:</b>\n"
-        f"{build_quantity_limits_text(min_quantity, max_quantity)}\n\n"
+        f"{build_quantity_limits_compact_text(min_quantity, max_quantity)}\n\n"
         "<b>أرسل الكمية التي تريد طلبها</b>\n"
         f"الثمن: <b>{price_line}</b>\n"
         "اكتب رقماً فقط، مثال: <code>1000</code>."
