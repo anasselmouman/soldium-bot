@@ -3,8 +3,6 @@ import logging
 
 import aiohttp
 
-from config import SMM_API_KEYS, API_URL
-
 logger = logging.getLogger(__name__)
 
 
@@ -13,13 +11,15 @@ class ProviderAuthError(RuntimeError):
 
 
 class SMMManager:
-    """
-    مدير الاتصال مع API الخاص بخدمات SMM.
-    """
+    """مدير الاتصال مع API الخاص بخدمات SMM."""
 
-    def __init__(self, api_key: str = SMM_API_KEYS["default"], api_url: str = API_URL) -> None:
-        self.api_key = api_key
-        self.api_url = api_url
+    def __init__(self, api_key: str, api_url: str) -> None:
+        if not str(api_key or "").strip():
+            raise ValueError("api_key is required")
+        if not str(api_url or "").strip():
+            raise ValueError("api_url is required")
+        self.api_key = api_key.strip()
+        self.api_url = api_url.strip()
 
     async def _parse_provider_response(
         self,
@@ -55,22 +55,19 @@ class SMMManager:
 
         return data
 
-    async def _post(self, action: str) -> dict | list:
-        """
-        دالة داخلية لإرسال الطلبات إلى API.
-        """
+    async def _post(self, action: str, *, timeout_seconds: float = 60) -> dict | list:
         payload = {
             "key": self.api_key,
             "action": action,
         }
 
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(self.api_url, data=payload) as response:
                 return await self._parse_provider_response(response, action=action)
 
-    async def _post_payload(self, payload: dict) -> dict | list:
-        timeout = aiohttp.ClientTimeout(total=20)
+    async def _post_payload(self, payload: dict, *, timeout_seconds: float = 60) -> dict | list:
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(self.api_url, data=payload) as response:
                 return await self._parse_provider_response(
@@ -79,28 +76,18 @@ class SMMManager:
                 )
 
     async def get_balance(self) -> dict:
-        """
-        جلب الرصيد الحالي من API (action=balance).
-        """
         data = await self._post(action="balance")
         if isinstance(data, dict):
             return data
         raise ValueError("صيغة استجابة الرصيد غير متوقعة من API.")
 
-    async def get_services(self) -> list[dict]:
-        """
-        جلب جميع الخدمات المتاحة من API (action=services).
-        """
-        data = await self._post(action="services")
+    async def get_services(self, *, timeout_seconds: float = 120) -> list[dict]:
+        data = await self._post(action="services", timeout_seconds=timeout_seconds)
         if isinstance(data, list):
             return data
         raise ValueError("صيغة استجابة الخدمات غير متوقعة من API.")
 
     async def add_order(self, service: int, link: str, quantity: int) -> dict:
-        """
-        إنشاء طلب فعلي عبر واجهة التنفيذ الخارجية.
-        يسلّم معرف الخدمة الرقمي المقابل للخدمة المطلوبة.
-        """
         payload = {
             "key": self.api_key,
             "action": "add",

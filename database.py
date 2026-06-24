@@ -82,6 +82,7 @@ class OrderRecord(TypedDict):
     start_count: int | None
     status_note: str | None
     api_account: str
+    provider_slug: str
 
 
 def _order_row_to_record(row: sqlite3.Row) -> OrderRecord:
@@ -92,6 +93,16 @@ def _order_row_to_record(row: sqlite3.Row) -> OrderRecord:
     api_account = "default"
     if "api_account" in keys and row["api_account"] is not None:
         api_account = str(row["api_account"]).strip() or "default"
+    provider_slug = ""
+    if "provider_slug" in keys and row["provider_slug"] is not None:
+        provider_slug = str(row["provider_slug"]).strip()
+    if not provider_slug:
+        try:
+            from services.provider_registry import get_default_provider_slug
+
+            provider_slug = get_default_provider_slug()
+        except Exception:
+            provider_slug = "gozibra"
     return {
         "id": int(row["id"]),
         "user_id": int(row["user_id"]),
@@ -107,6 +118,7 @@ def _order_row_to_record(row: sqlite3.Row) -> OrderRecord:
         "created_at": str(row["created_at"]),
         "status_note": status_note,
         "api_account": api_account,
+        "provider_slug": provider_slug,
     }
 
 
@@ -150,6 +162,134 @@ def _dedupe_active_deposit_proofs(connection: sqlite3.Connection) -> int:
             )
             superseded += int(cursor.rowcount or 0)
     return superseded
+
+
+def _migrate_provider_accounts_display_name(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(provider_accounts)").fetchall()
+    }
+    if "display_name" not in columns:
+        connection.execute(
+            "ALTER TABLE provider_accounts ADD COLUMN display_name TEXT NOT NULL DEFAULT ''"
+        )
+    from services.provider_registry import default_display_name_for_account
+
+    rows = connection.execute(
+        "SELECT id, account_key, display_name FROM provider_accounts"
+    ).fetchall()
+    for row in rows:
+        current = str(row["display_name"] or "").strip()
+        if current:
+            continue
+        label = default_display_name_for_account(str(row["account_key"]))
+        connection.execute(
+            "UPDATE provider_accounts SET display_name = ? WHERE id = ?",
+            (label, int(row["id"])),
+        )
+
+
+def _migrate_smm_services_catalog_identity(connection: sqlite3.Connection) -> None:
+    """
+    يرقّي smm_services إلى هوية مركّبة:
+    catalog_id (PK فريد للبوت) + (provider_slug, external_service_id) فريد.
+    """
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(smm_services)").fetchall()
+    }
+    if "catalog_id" in columns:
+        return
+
+    if "external_service_id" not in columns:
+        connection.execute(
+            "ALTER TABLE smm_services ADD COLUMN external_service_id TEXT NOT NULL DEFAULT ''"
+        )
+        connection.execute(
+            """
+            UPDATE smm_services
+            SET external_service_id = service_id
+            WHERE external_service_id = '' OR external_service_id IS NULL
+            """
+        )
+
+    connection.execute(
+        """
+        CREATE TABLE smm_services_v2 (
+            catalog_id TEXT PRIMARY KEY,
+            external_service_id TEXT NOT NULL,
+            provider_slug TEXT NOT NULL DEFAULT 'gozibra',
+            category TEXT NOT NULL DEFAULT '',
+            name_ar TEXT NOT NULL DEFAULT '',
+            provider_price_usd REAL NOT NULL DEFAULT 0,
+            local_price_dh REAL NOT NULL DEFAULT 0,
+            min_qty INTEGER NOT NULL DEFAULT 1,
+            max_qty INTEGER NOT NULL DEFAULT 1000000,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            platform_key TEXT NOT NULL DEFAULT '',
+            section_key TEXT,
+            subsection_key TEXT,
+            local_item_id TEXT NOT NULL DEFAULT '',
+            platform_title TEXT NOT NULL DEFAULT '',
+            section_title TEXT,
+            subsection_title TEXT,
+            fulfillment_mode TEXT NOT NULL DEFAULT 'auto',
+            provider_api_account TEXT,
+            provider_price_updated_at TEXT,
+            service_id TEXT NOT NULL DEFAULT '',
+            UNIQUE(provider_slug, external_service_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO smm_services_v2 (
+            catalog_id, external_service_id, provider_slug, category, name_ar,
+            provider_price_usd, local_price_dh, min_qty, max_qty, is_active,
+            platform_key, section_key, subsection_key, local_item_id,
+            platform_title, section_title, subsection_title,
+            fulfillment_mode, provider_api_account, provider_price_updated_at, service_id
+        )
+        SELECT
+            COALESCE(NULLIF(TRIM(local_item_id), ''), service_id),
+            COALESCE(NULLIF(TRIM(external_service_id), ''), service_id),
+            COALESCE(NULLIF(TRIM(provider_slug), ''), 'gozibra'),
+            category, name_ar, provider_price_usd, local_price_dh,
+            min_qty, max_qty, is_active, platform_key, section_key, subsection_key,
+            COALESCE(NULLIF(TRIM(local_item_id), ''), service_id),
+            platform_title, section_title, subsection_title,
+            COALESCE(fulfillment_mode, 'auto'),
+            provider_api_account, provider_price_updated_at,
+            COALESCE(NULLIF(TRIM(external_service_id), ''), service_id)
+        FROM smm_services
+        """
+    )
+    connection.execute("DROP TABLE smm_services")
+    connection.execute("ALTER TABLE smm_services_v2 RENAME TO smm_services")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_smm_services_active
+        ON smm_services (is_active, platform_key)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_smm_services_fulfillment
+        ON smm_services (fulfillment_mode, platform_key)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_smm_services_provider
+        ON smm_services (provider_slug, is_active)
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_smm_services_provider_external
+        ON smm_services (provider_slug, external_service_id)
+        """
+    )
 
 
 def init_db() -> None:
@@ -269,6 +409,15 @@ def init_db() -> None:
             connection.execute(
                 "ALTER TABLE orders ADD COLUMN fulfillment_mode TEXT NOT NULL DEFAULT 'auto'"
             )
+        if "provider_cost_dh" not in order_columns:
+            connection.execute(
+                "ALTER TABLE orders ADD COLUMN provider_cost_dh REAL NOT NULL DEFAULT 0"
+            )
+        if "status_changed_at" not in order_columns:
+            connection.execute("ALTER TABLE orders ADD COLUMN status_changed_at TEXT")
+            connection.execute(
+                "UPDATE orders SET status_changed_at = created_at WHERE status_changed_at IS NULL"
+            )
 
         connection.execute(
             """
@@ -334,6 +483,73 @@ def init_db() -> None:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS admin_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_type TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'warning',
+                entity_type TEXT NOT NULL,
+                entity_id TEXT,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                payload_json TEXT,
+                fingerprint TEXT NOT NULL UNIQUE,
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                status TEXT NOT NULL DEFAULT 'open',
+                dismissed_at TEXT,
+                telegram_notified INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_admin_alerts_status
+            ON admin_alerts (status, severity, last_seen_at)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'info',
+                title TEXT NOT NULL,
+                body_html TEXT NOT NULL DEFAULT '',
+                body_plain TEXT NOT NULL DEFAULT '',
+                entity_type TEXT,
+                entity_id TEXT,
+                user_id INTEGER,
+                source TEXT NOT NULL DEFAULT 'bot',
+                channel TEXT NOT NULL DEFAULT 'telegram',
+                telegram_sent INTEGER NOT NULL DEFAULT 0,
+                telegram_error TEXT,
+                is_read INTEGER NOT NULL DEFAULT 0,
+                read_at TEXT,
+                payload_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_admin_notifications_created
+            ON admin_notifications (created_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_admin_notifications_unread
+            ON admin_notifications (is_read, created_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_admin_notifications_category
+            ON admin_notifications (category, created_at DESC)
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS pending_referral_level_upgrades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -393,6 +609,50 @@ def init_db() -> None:
             ON smm_services (fulfillment_mode, platform_key)
             """
         )
+        if "provider_api_account" not in smm_columns:
+            connection.execute(
+                "ALTER TABLE smm_services ADD COLUMN provider_api_account TEXT"
+            )
+        if "provider_price_updated_at" not in smm_columns:
+            connection.execute(
+                "ALTER TABLE smm_services ADD COLUMN provider_price_updated_at TEXT"
+            )
+        if "provider_slug" not in smm_columns:
+            connection.execute(
+                "ALTER TABLE smm_services ADD COLUMN provider_slug TEXT NOT NULL DEFAULT 'gozibra'"
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_smm_services_provider
+            ON smm_services (provider_slug, is_active)
+            """
+        )
+
+        from services.provider_registry import seed_default_gozibra_provider
+
+        seed_default_gozibra_provider(connection)
+
+        _migrate_provider_accounts_display_name(connection)
+
+        _migrate_smm_services_catalog_identity(connection)
+
+        if "provider_slug" not in order_columns:
+            connection.execute(
+                "ALTER TABLE orders ADD COLUMN provider_slug TEXT NOT NULL DEFAULT 'gozibra'"
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_orders_provider
+            ON orders (provider_slug, api_account)
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_orders_provider_ref
+            ON orders (provider_slug, provider_order_id)
+            """
+        )
 
         connection.execute(
             """
@@ -434,6 +694,33 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_timed_announcements_status_ends
             ON timed_announcements (status, ends_at)
+            """
+        )
+
+        timed_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(timed_announcements)").fetchall()
+        }
+        if "auto_delete_seconds" not in timed_columns:
+            connection.execute(
+                "ALTER TABLE timed_announcements ADD COLUMN auto_delete_seconds INTEGER"
+            )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_message_deletions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                delete_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_scheduled_deletions_delete_at
+            ON scheduled_message_deletions (delete_at)
             """
         )
 
@@ -627,8 +914,10 @@ def create_order_with_balance_hold(
     amount: float,
     *,
     api_account: str = "default",
+    provider_slug: str | None = None,
     initial_status: str = "pending",
     fulfillment_mode: str = "auto",
+    provider_cost_dh: float = 0.0,
 ) -> int | None:
     amount_money = to_float(amount)
     with get_connection() as connection:
@@ -661,6 +950,14 @@ def create_order_with_balance_hold(
             return None
 
         account = str(api_account or "default").strip() or "default"
+        slug = str(provider_slug or "").strip().lower()
+        if not slug:
+            try:
+                from services.provider_registry import get_default_provider_slug
+
+                slug = get_default_provider_slug()
+            except Exception:
+                slug = "gozibra"
         status = str(initial_status or "pending").strip() or "pending"
         mode = str(fulfillment_mode or "auto").strip().lower() or "auto"
         if mode not in {"auto", "admin"}:
@@ -669,9 +966,9 @@ def create_order_with_balance_hold(
             """
             INSERT INTO orders (
                 user_id, service_name, service_id, link, quantity, amount, total_price, status,
-                api_account, fulfillment_mode
+                api_account, provider_slug, fulfillment_mode, provider_cost_dh
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -683,7 +980,9 @@ def create_order_with_balance_hold(
                 amount_money,
                 status,
                 account,
+                slug,
                 mode,
+                round(to_float(provider_cost_dh), 6),
             ),
         )
         connection.commit()
@@ -971,14 +1270,24 @@ def update_order_status(order_id: int, status: str, *, start_count: int | None =
     (مستخرج من واجهة الحالة) ليُخزَّن مع الطلب.
     """
     with get_connection() as connection:
+        row = connection.execute(
+            "SELECT status FROM orders WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        status_changed = normalize_order_status_key(str(row["status"])) != normalize_order_status_key(
+            status
+        )
+        ts_clause = ", status_changed_at = CURRENT_TIMESTAMP" if status_changed else ""
         if _is_execution_status(status) and start_count is not None:
             cursor = connection.execute(
-                "UPDATE orders SET status = ?, start_count = ? WHERE id = ?",
+                f"UPDATE orders SET status = ?, start_count = ?{ts_clause} WHERE id = ?",
                 (status, int(start_count), order_id),
             )
         else:
             cursor = connection.execute(
-                "UPDATE orders SET status = ? WHERE id = ?",
+                f"UPDATE orders SET status = ?{ts_clause} WHERE id = ?",
                 (status, order_id),
             )
         connection.commit()
@@ -997,7 +1306,9 @@ def set_provider_order_id(order_id: int, provider_order_id: str) -> bool:
         cursor = connection.execute(
             """
             UPDATE orders
-            SET provider_order_id = ?, status = 'submitted'
+            SET provider_order_id = ?,
+                status = 'submitted',
+                status_changed_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (provider_order_id, order_id),
@@ -1024,16 +1335,34 @@ def assign_provider_order_id(order_id: int, provider_order_id: str) -> bool:
         return cursor.rowcount > 0
 
 
-def get_order_id_by_provider_ref(provider_ref: str) -> int | None:
+def get_order_id_by_provider_ref(
+    provider_ref: str,
+    *,
+    provider_slug: str | None = None,
+) -> int | None:
     ref = str(provider_ref or "").strip().lstrip("#")
     if not ref:
         return None
+    slug = str(provider_slug or "").strip().lower() or None
     with get_connection() as connection:
-        row = connection.execute(
-            "SELECT id FROM orders WHERE provider_order_id = ?",
+        if slug:
+            row = connection.execute(
+                """
+                SELECT id FROM orders
+                WHERE provider_slug = ? AND provider_order_id = ?
+                """,
+                (slug, ref),
+            ).fetchone()
+            return int(row["id"]) if row else None
+        rows = connection.execute(
+            "SELECT id, provider_slug FROM orders WHERE provider_order_id = ?",
             (ref,),
-        ).fetchone()
-    return int(row["id"]) if row else None
+        ).fetchall()
+    if not rows:
+        return None
+    if len(rows) == 1:
+        return int(rows[0]["id"])
+    return None
 
 
 def refund_order(order_id: int) -> bool:
@@ -1059,7 +1388,8 @@ def refund_order(order_id: int) -> bool:
             """
             UPDATE orders
             SET status = 'failed',
-                refunded_amount = ROUND(COALESCE(amount, 0), 6)
+                refunded_amount = ROUND(COALESCE(amount, 0), 6),
+                status_changed_at = CURRENT_TIMESTAMP
             WHERE id = ?
               AND LOWER(REPLACE(status, '_', ' ')) NOT IN (
                   'failed', 'canceled', 'refunded', 'partial', 'completed'
@@ -1081,7 +1411,7 @@ def get_user_orders(user_id: int, limit: int = 10) -> list[OrderRecord]:
         rows = connection.execute(
             """
             SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
-                   start_count, created_at, status_note, api_account
+                   start_count, created_at, status_note, api_account, provider_slug
             FROM orders
             WHERE user_id = ?
             ORDER BY id DESC
@@ -1101,7 +1431,7 @@ def search_user_orders(user_id: int, query: str) -> list[OrderRecord]:
         rows = connection.execute(
             """
             SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
-                   start_count, created_at, status_note, api_account
+                   start_count, created_at, status_note, api_account, provider_slug
             FROM orders
             WHERE user_id = ?
               AND (
@@ -1121,7 +1451,7 @@ def get_last_orders(limit: int = 10) -> list[OrderRecord]:
         rows = connection.execute(
             """
             SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
-                   start_count, created_at, status_note, api_account
+                   start_count, created_at, status_note, api_account, provider_slug
             FROM orders
             ORDER BY id DESC
             LIMIT ?
@@ -1262,7 +1592,8 @@ def set_order_status_by_admin(order_id: int, status: str) -> bool:
                 """
                 UPDATE orders
                 SET status = ?,
-                    refunded_amount = ROUND(COALESCE(amount, 0), 6)
+                    refunded_amount = ROUND(COALESCE(amount, 0), 6),
+                    status_changed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                   AND LOWER(REPLACE(status, '_', ' ')) NOT IN ('failed', 'canceled', 'refunded')
                 """,
@@ -1287,7 +1618,8 @@ def set_order_status_by_admin(order_id: int, status: str) -> bool:
             order_cursor = connection.execute(
                 """
                 UPDATE orders
-                SET status = ?
+                SET status = ?,
+                    status_changed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                   AND LOWER(REPLACE(status, '_', ' ')) NOT IN ('failed', 'canceled', 'refunded')
                 """,
@@ -1307,7 +1639,8 @@ def set_order_status_by_admin(order_id: int, status: str) -> bool:
             order_cursor = connection.execute(
                 """
                 UPDATE orders
-                SET status = ?
+                SET status = ?,
+                    status_changed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                   AND LOWER(REPLACE(status, '_', ' ')) NOT IN (
                       'failed', 'canceled', 'refunded', 'completed'
@@ -1325,7 +1658,8 @@ def set_order_status_by_admin(order_id: int, status: str) -> bool:
         order_cursor = connection.execute(
             """
             UPDATE orders
-            SET status = ?
+            SET status = ?,
+                status_changed_at = CURRENT_TIMESTAMP
             WHERE id = ?
               AND LOWER(REPLACE(status, '_', ' ')) NOT IN ('failed', 'canceled', 'refunded')
             """,
@@ -1371,7 +1705,7 @@ def get_pending_admin_orders_ordered() -> list[OrderRecord]:
         rows = connection.execute(
             """
             SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
-                   start_count, created_at, status_note, api_account
+                   start_count, created_at, status_note, api_account, provider_slug
             FROM orders
             WHERE LOWER(REPLACE(status, '_', ' ')) = 'pending admin'
             ORDER BY id ASC
@@ -1397,7 +1731,7 @@ def get_trackable_orders(limit: int = 200) -> list[OrderRecord]:
         rows = connection.execute(
             """
             SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
-                   start_count, created_at, status_note, api_account
+                   start_count, created_at, status_note, api_account, provider_slug
             FROM orders
             WHERE provider_order_id IS NOT NULL
               AND provider_order_id != ''
@@ -1455,7 +1789,8 @@ def apply_partial_or_full_refund(
                 UPDATE orders
                 SET status = ?,
                     refunded_amount = ROUND(COALESCE(refunded_amount, 0) + ?, 6),
-                    status_note = ?
+                    status_note = ?,
+                    status_changed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                   AND LOWER(REPLACE(status, '_', ' ')) NOT IN (
                       'failed', 'canceled', 'partial', 'refunded', 'completed'
@@ -1468,7 +1803,8 @@ def apply_partial_or_full_refund(
                 """
                 UPDATE orders
                 SET status = ?,
-                    refunded_amount = ROUND(COALESCE(refunded_amount, 0) + ?, 6)
+                    refunded_amount = ROUND(COALESCE(refunded_amount, 0) + ?, 6),
+                    status_changed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                   AND LOWER(REPLACE(status, '_', ' ')) NOT IN (
                       'failed', 'canceled', 'partial', 'refunded', 'completed'
@@ -2469,7 +2805,7 @@ def get_pending_timed_announcements_for_user(user_id: int) -> list[dict[str, obj
         _expire_timed_announcements(connection)
         rows = connection.execute(
             """
-            SELECT ta.id, ta.message_html, ta.ends_at
+            SELECT ta.id, ta.message_html, ta.ends_at, ta.auto_delete_seconds
             FROM timed_announcements ta
             WHERE ta.status = 'active'
               AND ta.ends_at > datetime('now')
@@ -2482,6 +2818,11 @@ def get_pending_timed_announcements_for_user(user_id: int) -> list[dict[str, obj
             "id": int(row["id"]),
             "message_html": str(row["message_html"]),
             "ends_at": str(row["ends_at"]),
+            "auto_delete_seconds": (
+                int(row["auto_delete_seconds"])
+                if row["auto_delete_seconds"] is not None
+                else None
+            ),
         }
         for row in rows
     ]

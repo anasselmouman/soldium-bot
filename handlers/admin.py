@@ -36,7 +36,7 @@ from keyboards.admin import (
     build_admin_withdrawal_actions,
 )
 from utils.withdraw_details import format_withdraw_details_admin_lines, safe_withdraw_details
-from smm_api import SMMManager
+from services.provider_ops import fetch_all_provider_balances, format_balance_report
 from utils.smart_notifications import send_smart_notification
 from utils.money import format_dh
 from services.referral import PARTNER_LEVEL_UPGRADE_HTML as PARTNER_WELCOME_HTML
@@ -44,7 +44,6 @@ from utils.states import AdminFlow
 
 router = Router()
 logger = logging.getLogger(__name__)
-smm_manager = SMMManager()
 
 
 @router.callback_query(F.data == "admin:system_balance")
@@ -55,12 +54,13 @@ async def system_balance_handler(callback: CallbackQuery) -> None:
         await callback.answer("غير مصرح", show_alert=True)
         return
     try:
-        data = await smm_manager.get_balance()
-        balance = data.get("balance", "N/A")
-        currency = data.get("currency", "USD")
-        await callback.message.answer(
-            f"<b>💰 الرصيد المتاح للنظام</b>\n<code>{balance} {currency}</code>"
-        )
+        snapshots = await fetch_all_provider_balances()
+        if not snapshots:
+            await callback.message.answer(
+                "⚠️ لا توجد حسابات مزوّد نشطة. راجع جداول providers و provider_accounts."
+            )
+        else:
+            await callback.message.answer(format_balance_report(snapshots))
     except Exception as exc:
         logger.exception("Failed system balance fetch: %s", exc)
         await callback.message.answer("⚠️ تعذر جلب الرصيد المتاح للنظام الآن.")
@@ -81,7 +81,7 @@ async def stats_handler(callback: CallbackQuery) -> None:
         f"• طلبات الشحن المعلقة: <b>{count_pending_deposits()}</b>\n"
         f"• طلبات السحب المعلقة: <b>{count_pending_withdrawals()}</b>\n"
         f"• طلبات بانتظار الأدمن: <b>{count_pending_admin_orders()}</b>\n"
-        f"• إجمالي الأرباح: <code>{format_dh(sum_revenue())}</code>"
+        f"• إجمالي المبيعات: <code>{format_dh(sum_revenue())}</code>"
     )
     await callback.answer()
 

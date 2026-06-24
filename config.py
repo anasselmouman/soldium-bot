@@ -1,6 +1,7 @@
 """
 إعدادات مشروع SOLDIUM.
 المفاتيح الحساسة تُقرأ من متغيرات البيئة (ملف .env اختياري).
+إعدادات المزوّدين تُدار عبر جداول providers / provider_accounts في قاعدة البيانات.
 """
 
 from __future__ import annotations
@@ -38,35 +39,18 @@ def _env_int(name: str) -> int:
     return int(_require_env(name))
 
 
+def _optional_env(name: str) -> str:
+    return os.environ.get(name, "").strip()
+
+
 # توكن البوت الخاص بـ Telegram
 BOT_TOKEN = _require_env("BOT_TOKEN")
 
-# إعدادات مزود خدمات SMM (مفتاح لكل منصة)
-SMM_KEY_INSTAGRAM = _require_env("SMM_KEY_INSTAGRAM")
-SMM_KEY_FACEBOOK = _require_env("SMM_KEY_FACEBOOK")
-SMM_KEY_TIKTOK = _require_env("SMM_KEY_TIKTOK")
-SMM_KEY_DEFAULT = _require_env("SMM_KEY_DEFAULT")
-API_URL = os.environ.get("API_URL", "https://gozibra.com/api/v2").strip()
-
-SMM_API_KEYS: dict[str, str] = {
-    "instagram": SMM_KEY_INSTAGRAM,
-    "facebook": SMM_KEY_FACEBOOK,
-    "tiktok": SMM_KEY_TIKTOK,
-    "default": SMM_KEY_DEFAULT,
-}
-
-
-def api_key_for_account(account_type: str) -> str:
-    """يرجع مفتاح API للحساب المخزّن على الطلب (أو default)."""
-    key = str(account_type or "").strip().lower()
-    if key not in SMM_API_KEYS:
-        key = "default"
-    api_key = SMM_API_KEYS[key].strip()
-    if not api_key:
-        raise RuntimeError(
-            f"مفتاح SMM_KEY_{key.upper()} غير معرّف. راجع ملف .env وأعد تشغيل البوت."
-        )
-    return api_key
+# مفاتيح SMM اختيارية — تُستخدم فقط عند تهيئة Gozibra في الترحيل الأولي
+SMM_KEY_INSTAGRAM = _optional_env("SMM_KEY_INSTAGRAM")
+SMM_KEY_FACEBOOK = _optional_env("SMM_KEY_FACEBOOK")
+SMM_KEY_TIKTOK = _optional_env("SMM_KEY_TIKTOK")
+SMM_KEY_DEFAULT = _optional_env("SMM_KEY_DEFAULT")
 
 # رابط الدعم الفني (محادثة تيليغرام)
 SUPPORT_LINK = os.environ.get("SUPPORT_LINK", "https://t.me/SoldiumSupport").strip()

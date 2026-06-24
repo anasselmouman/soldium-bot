@@ -6,6 +6,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from keyboards.nav_labels import BTN_BACK, BTN_BACK_STEP, BTN_MY_ACCOUNT, attach_cross_area_nav
 from keyboards.orders import build_flow_navigation_keyboard
+from config import SUPPORT_LINK, WHATSAPP_SUPPORT_LINK
 from utils.payment_banks import PAYMENT_METHODS, PaymentMethod
 
 
@@ -39,6 +40,23 @@ def build_payment_methods_menu() -> InlineKeyboardMarkup:
         text="📱 بطاقات التعبئة (يصلك 70% فقط) 📱",
         callback_data="deposit:recharge",
     )
+    builder.button(
+        text="💬 أملك طريقة دفع أخرى",
+        callback_data="deposit:other_method",
+    )
+    builder.adjust(1)
+    nav = InlineKeyboardBuilder()
+    attach_cross_area_nav(nav)
+    builder.attach(nav)
+    return builder.as_markup()
+
+
+def build_deposit_other_payment_menu() -> InlineKeyboardMarkup:
+    """تواصل مع الدعم عند امتلاك طريقة دفع غير مدرجة في القائمة."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 تواصل مع خدمة العملاء 💬", url=SUPPORT_LINK)
+    builder.button(text="📱 تواصل عبر الواتساب 📱", url=WHATSAPP_SUPPORT_LINK)
+    builder.button(text=BTN_BACK_STEP, callback_data="deposit:back")
     builder.adjust(1)
     nav = InlineKeyboardBuilder()
     attach_cross_area_nav(nav)

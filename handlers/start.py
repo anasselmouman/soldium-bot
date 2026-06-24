@@ -52,8 +52,7 @@ from keyboards.support import build_support_markup
 from utils.critical_points import build_critical_points_html
 from utils.ui_branding import format_breadcrumb, screen_body
 from services.referral import parse_referrer_id_from_start_payload
-from services.smm_api_router import smm_manager_for_account
-from smm_api import SMMManager
+from services.smm_api_router import smm_manager_for_order
 from utils.telegram_ui import allow_new_message_fallback, safe_edit_message_text, send_finance_coming_soon_flash
 from utils.entry_delivery import deliver_post_entry_messages
 from utils.money import format_dh
@@ -66,7 +65,6 @@ from utils.states import AccountFlow
 
 router = Router()
 logger = logging.getLogger(__name__)
-smm_manager = SMMManager()
 
 SEARCH_STEP_RESTORE_KEY = "search_step_restore_text"
 
@@ -169,8 +167,7 @@ async def _build_my_orders_message_html(
         status_note = order.get("status_note")
         if exec_ref:
             try:
-                account = str(order.get("api_account") or "default")
-                status_data = await smm_manager_for_account(account).get_order_status(
+                status_data = await smm_manager_for_order(order).get_order_status(
                     exec_ref
                 )
                 snapshot = await apply_provider_status_to_order(

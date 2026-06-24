@@ -34,8 +34,9 @@ from keyboards.orders import (
 from utils.critical_points import build_critical_points_html
 from utils.ui_branding import ACCOUNT_PERSISTENCE_HTML
 from services_config import SERVICES, reload_services
-from smm_api import ProviderAuthError, SMMManager
+from smm_api import ProviderAuthError
 from utils.money import format_amount_2, to_decimal, to_float
+from utils.order_economics import provider_cost_dh_from_service
 from utils.flow_transcript import (
     acknowledge_then_focus_living_ui,
     delete_flow_step_prompt,
@@ -86,13 +87,15 @@ from utils.telegram_ui import (
     allow_new_message_fallback,
     safe_edit_message_text,
 )
-from services.provider_catalog import get_provider_limits, refresh_provider_catalog
-from services.smm_api_router import get_provider_credentials, smm_manager_for_account
+from services.provider_catalog import get_provider_limits, refresh_all_provider_catalogs
+from services.smm_api_router import (
+    get_provider_credentials_for_service,
+    smm_manager_for_account,
+)
 from utils.notices import resolve_link_prompt, resolve_section_notice
 
 router = Router()
 logger = logging.getLogger(__name__)
-smm_manager = SMMManager()
 ORDER_FLASH_RESTORE_KEY = "order_flash_restore_text"
 IPTV_PANEL_NOTES_MSG_KEY = "iptv_panel_notes_message_id"
 
@@ -469,8 +472,12 @@ async def _submit_order_to_provider(
     link: str,
     quantity: int,
     api_account: str,
+    provider_slug: str,
 ) -> str:
-    provider_response = await smm_manager_for_account(api_account).add_order(
+    provider_response = await smm_manager_for_account(
+        api_account,
+        provider_slug,
+    ).add_order(
         service=int(service["provider_id"]),
         link=link,
         quantity=quantity,
@@ -701,7 +708,7 @@ def _safe_int(value: object, default: int) -> int:
 
 
 async def _refresh_provider_limits_cache(force: bool = False) -> None:
-    await refresh_provider_catalog(smm_manager, force=force)
+    await refresh_all_provider_catalogs(force=force)
 
 
 async def _effective_limits(service: dict) -> tuple[int, int]:
@@ -712,14 +719,25 @@ async def _effective_limits(service: dict) -> tuple[int, int]:
 
     local_min = _safe_int(service.get("min", 1), default=1)
     local_max = _safe_int(service.get("max", 1_000_000_000), default=1_000_000_000)
-    provider_id = _safe_int(service.get("provider_id"), default=0)
+    external_id = _safe_int(
+        service.get("external_service_id") or service.get("provider_id"),
+        default=0,
+    )
+    provider_slug = str(service.get("provider_slug") or "").strip().lower()
     provider_limits: tuple[int, int] | None = None
-    if provider_id > 0:
+    if external_id > 0 and provider_slug:
         try:
             await _refresh_provider_limits_cache()
-            if get_provider_limits(provider_id) is None:
+            provider_limits = get_provider_limits(
+                external_id,
+                provider_slug=provider_slug,
+            )
+            if provider_limits is None:
                 await _refresh_provider_limits_cache(force=True)
-            provider_limits = get_provider_limits(provider_id)
+                provider_limits = get_provider_limits(
+                    external_id,
+                    provider_slug=provider_slug,
+                )
         except Exception as exc:
             logger.warning("Failed to refresh provider limits cache: %s", exc)
     return compute_effective_limits(
@@ -731,14 +749,20 @@ async def _effective_limits(service: dict) -> tuple[int, int]:
 
 
 async def _provider_limits_for_service(service: dict) -> tuple[int, int] | None:
-    provider_id = _safe_int(service.get("provider_id"), default=0)
-    if provider_id <= 0:
+    external_id = _safe_int(
+        service.get("external_service_id") or service.get("provider_id"),
+        default=0,
+    )
+    provider_slug = str(service.get("provider_slug") or "").strip().lower()
+    if external_id <= 0 or not provider_slug:
         return None
     try:
         await _refresh_provider_limits_cache()
-        if get_provider_limits(provider_id) is None:
+        limits = get_provider_limits(external_id, provider_slug=provider_slug)
+        if limits is None:
             await _refresh_provider_limits_cache(force=True)
-        return get_provider_limits(provider_id)
+            limits = get_provider_limits(external_id, provider_slug=provider_slug)
+        return limits
     except Exception as exc:
         logger.warning("Failed to read provider limits for service %s: %s", service.get("id"), exc)
         return None
@@ -1715,6 +1739,64 @@ async def _show_platform_landing(
         )
 
 
+async def _navigate_back_to_services_list(
+    state: FSMContext,
+    *,
+    bot: Bot,
+    user_id: int,
+    message: Message,
+) -> None:
+    """العودة من خطوة الطلب إلى قائمة الخدمات التي جاء منها المستخدم."""
+    chat_id = message.chat.id
+    data = await state.get_data()
+    platform_key = str(data.get("platform_key", "")).strip()
+    section_key = str(data.get("section_key", "") or "").strip()
+    subsection_key = str(data.get("subsection_key", "") or "").strip()
+
+    await purge_flow_transcript(bot, state, user_id, chat_id)
+    await delete_flow_step_prompt(bot, state, chat_id)
+
+    has_real_section = section_key.lower() not in {"", "none", "direct"}
+    if subsection_key:
+        await _show_services(
+            state,
+            platform_key,
+            section_key,
+            subsection_key,
+            bot=bot,
+            user_id=user_id,
+            message=message,
+            use_edit=True,
+        )
+        return
+    if has_real_section:
+        section = ((SERVICES.get(platform_key, {}) or {}).get("sections") or {}).get(section_key) or {}
+        if section.get("subsections"):
+            await _show_subsections(
+                state,
+                platform_key,
+                section_key,
+                bot=bot,
+                user_id=user_id,
+                message=message,
+                use_edit=True,
+            )
+            return
+        await _show_services(
+            state,
+            platform_key,
+            section_key,
+            bot=bot,
+            user_id=user_id,
+            message=message,
+            use_edit=True,
+        )
+        return
+    await _show_platform_landing(
+        state, platform_key, bot=bot, user_id=user_id, message=message
+    )
+
+
 async def _handle_back_navigation(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if not callback.from_user or not callback.message:
         return
@@ -1791,45 +1873,8 @@ async def _handle_back_navigation(callback: CallbackQuery, state: FSMContext, bo
         return
 
     if current_state == OrderFlow.enter_link.state:
-        await purge_flow_transcript(bot, state, user_id, chat_id)
-        has_real_section = section_key.lower() not in {"", "none", "direct"}
-        if subsection_key:
-            await _show_services(
-                state,
-                platform_key,
-                section_key,
-                subsection_key,
-                bot=bot,
-                user_id=user_id,
-                message=msg,
-                use_edit=True,
-            )
-            return
-        if has_real_section:
-            section = ((SERVICES.get(platform_key, {}) or {}).get("sections") or {}).get(section_key) or {}
-            if section.get("subsections"):
-                await _show_subsections(
-                    state,
-                    platform_key,
-                    section_key,
-                    bot=bot,
-                    user_id=user_id,
-                    message=msg,
-                    use_edit=True,
-                )
-                return
-            await _show_services(
-                state,
-                platform_key,
-                section_key,
-                bot=bot,
-                user_id=user_id,
-                message=msg,
-                use_edit=True,
-            )
-            return
-        await _show_platform_landing(
-            state, platform_key, bot=bot, user_id=user_id, message=msg
+        await _navigate_back_to_services_list(
+            state, bot=bot, user_id=user_id, message=msg
         )
         return
 
@@ -1896,6 +1941,25 @@ async def order_nav_back(callback: CallbackQuery, state: FSMContext, bot: Bot) -
         return
     await clear_last_prompt(callback.message, state, bot=bot)
     await _handle_back_navigation(callback, state, bot)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "order:nav:back_services")
+async def order_nav_back_services(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    data = await state.get_data()
+    platform_key = str(data.get("platform_key", "")).strip()
+    if not platform_key:
+        await callback.answer("تعذر تحديد قائمة الخدمات", show_alert=True)
+        return
+    await clear_last_prompt(callback.message, state, bot=bot)
+    await _navigate_back_to_services_list(
+        state,
+        bot=bot,
+        user_id=callback.from_user.id,
+        message=callback.message,
+    )
     await callback.answer()
 
 
@@ -2094,8 +2158,8 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         _trail_from_order_context(platform_key, section_key, subsection_key)
     )
     try:
-        provider_creds = get_provider_credentials(
-            service_category, str(service["name"])
+        provider_creds = get_provider_credentials_for_service(
+            service, service_category
         )
     except RuntimeError as exc:
         await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
@@ -2112,6 +2176,8 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         return
 
     api_account = provider_creds["account_type"]
+    provider_slug = provider_creds["provider_slug"]
+    snapshot_provider_cost = provider_cost_dh_from_service(service, quantity)
 
     if requires_admin:
         order_id = create_order_with_balance_hold(
@@ -2122,8 +2188,10 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
             quantity=quantity,
             amount=to_float(total_price),
             api_account=api_account,
+            provider_slug=provider_slug,
             initial_status="pending_admin",
             fulfillment_mode=FULFILLMENT_ADMIN,
+            provider_cost_dh=snapshot_provider_cost,
         )
     else:
         order_id = create_order_with_balance_hold(
@@ -2134,6 +2202,8 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
             quantity=quantity,
             amount=to_float(total_price),
             api_account=api_account,
+            provider_slug=provider_slug,
+            provider_cost_dh=snapshot_provider_cost,
         )
     if not order_id:
         header = await _order_breadcrumb_from_state(
@@ -2161,6 +2231,7 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
             link,
             quantity,
             api_account,
+            provider_slug,
         )
         if requires_admin:
             assign_provider_order_id(order_id, provider_order_id)
@@ -2245,6 +2316,8 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         user_record = get_user(user_id)
         trail = _trail_from_order_context(platform_key, section_key, subsection_key)
         order_type_label = " › ".join(trail) if trail else str(service["name"])
+        platform_meta = SERVICES.get(platform_key, {}) or {}
+        platform_title = str(platform_meta.get("title") or platform_key or "")
         await notify_admin_new_manual_order(
             bot,
             order_id=order_id,
@@ -2256,6 +2329,10 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
             link=link,
             quantity=quantity,
             amount=to_float(total_price),
+            platform_key=platform_key,
+            platform_title=platform_title,
+            provider_slug=provider_slug,
+            api_account=api_account,
         )
 
     success_bc = await _order_breadcrumb_from_state(
@@ -2264,7 +2341,14 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         service_name=str(service["name"]),
         step_label="تم الطلب",
     )
+    flow_data = await state.get_data()
+    services_return_ctx = {
+        "platform_key": flow_data.get("platform_key"),
+        "section_key": flow_data.get("section_key"),
+        "subsection_key": flow_data.get("subsection_key"),
+    }
     await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+    await state.update_data(**services_return_ctx)
     receipt = _build_order_success_receipt_html(
         provider_order_id,
         link,

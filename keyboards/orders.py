@@ -32,6 +32,10 @@ def _append_standard_controls(builder: InlineKeyboardBuilder, back_callback: str
 
 # --- 2. أزرار التحكم في التدفق (Flow Control) ---
 
+CB_ORDER_BACK_SERVICES = "order:nav:back_services"
+BTN_BACK_SERVICES = "🔙 العودة لقائمة الخدمات"
+
+
 def build_flow_navigation_keyboard(back_callback: str = "order:nav:back") -> InlineKeyboardMarkup:
     """زر رجوع بسيط للتنقل بين الخطوات الخطية"""
     builder = InlineKeyboardBuilder()
@@ -40,11 +44,12 @@ def build_flow_navigation_keyboard(back_callback: str = "order:nav:back") -> Inl
     return builder.as_markup()
 
 def build_order_success_nav_keyboard() -> InlineKeyboardMarkup:
-    """تنقل بعد إتمام الطلب — الرئيسية وحسابي فقط."""
+    """تنقل بعد إتمام الطلب — العودة للخدمات ثم الرئيسية وحسابي."""
     builder = InlineKeyboardBuilder()
+    builder.button(text=BTN_BACK_SERVICES, callback_data=CB_ORDER_BACK_SERVICES)
     builder.button(text=BTN_MAIN_HOME, callback_data=CB_MENU_HOME)
     builder.button(text="👤 حسابي وطلباتي", callback_data="menu:account")
-    builder.adjust(2)
+    builder.adjust(1, 2)
     return builder.as_markup()
 
 

@@ -53,6 +53,7 @@ from keyboards.payment import (
     build_bank_step_nav,
     build_deposit_history_menu,
     build_deposit_nav_footer,
+    build_deposit_other_payment_menu,
     build_payment_methods_menu,
     build_recharge_code_step_nav,
     build_recharge_face_value_menu,
@@ -398,6 +399,19 @@ def _format_deposit_gateway_text() -> str:
             f"<b>{int(MIN_PAYPAL_DEPOSIT_USD)}</b> USD لـ PayPal، "
             f"<b>{int(MIN_CRYPTO_DEPOSIT_USDT)}</b> USDT للكريبتو)"
         ),
+    )
+
+
+def _format_deposit_other_payment_text() -> str:
+    return screen_body(
+        "🏠 <b>الرئيسي</b> &gt; <b>إضافة رصيد</b> &gt; <b>طريقة دفع أخرى</b>",
+        "",
+        "إذا كانت لديك <b>طريقة دفع أخرى</b> غير المتوافرة في القائمة، "
+        "تواصل مع فريق الدعم وسنساعدك على إتمام عملية الشحن.",
+        "",
+        "📌 عند المراسلة، اذكر <b>المبلغ</b> و<b>طريقة الدفع</b> التي تفضّلها لتسريع المعالجة.",
+        "",
+        "اختر وسيلة التواصل المناسبة من الأسفل:",
     )
 
 
@@ -1758,6 +1772,27 @@ async def _render_recharge_face_value_step(
     )
 
 
+async def _render_deposit_other_payment(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+) -> None:
+    if not callback.message or not callback.from_user:
+        return
+    user_id = callback.from_user.id
+    await clear_last_prompt(callback.message, state)
+    await purge_flow_transcript(bot, state, user_id, callback.message.chat.id)
+    await state.clear()
+    await _edit_payment_from_callback(
+        callback,
+        state,
+        bot,
+        text=_format_deposit_other_payment_text(),
+        reply_markup=build_deposit_other_payment_menu(),
+        register_living=True,
+    )
+
+
 async def _render_recharge_telecom_menu(
     callback: CallbackQuery,
     state: FSMContext,
@@ -1774,6 +1809,12 @@ async def _render_recharge_telecom_menu(
         text=_format_recharge_telecom_selection_text(),
         reply_markup=build_recharge_telecom_menu(),
     )
+
+
+@router.callback_query(F.data == "deposit:other_method")
+async def deposit_other_method_handler(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await _render_deposit_other_payment(callback, state, bot)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "deposit:recharge")
@@ -1954,8 +1995,34 @@ async def receive_recharge_code_handler(message: Message, state: FSMContext, bot
             parse_mode="HTML",
             reply_markup=build_admin_recharge_actions(deposit_id),
         )
+        telegram_sent = True
+        telegram_error = None
     except TelegramBadRequest as exc:
+        telegram_sent = False
+        telegram_error = str(exc)
         logger.exception("Failed to notify admin for recharge %s: %s", deposit_id, exc)
+    try:
+        from services.admin_notification_log import log_admin_notification
+
+        log_admin_notification(
+            category="deposit_recharge",
+            title="طلب تعبئة جديد",
+            body_html=admin_text,
+            severity="info",
+            entity_type="deposit",
+            entity_id=str(deposit_id),
+            user_id=user.id,
+            telegram_sent=telegram_sent,
+            telegram_error=telegram_error,
+            payload={
+                "deposit_id": deposit_id,
+                "telecom_label": telecom_label,
+                "face_value": face_value,
+                "recharge_code": code,
+            },
+        )
+    except Exception:
+        logger.exception("Failed to log admin recharge notification deposit_id=%s", deposit_id)
 
     await track_transcript_user_message(state, message)
     await edit_user_living_ui(
@@ -2068,8 +2135,33 @@ async def receive_deposit_receipt_handler(message: Message, state: FSMContext, b
             parse_mode="HTML",
             reply_markup=build_admin_deposit_actions(deposit_id),
         )
+        telegram_sent = True
+        telegram_error = None
     except TelegramBadRequest as exc:
+        telegram_sent = False
+        telegram_error = str(exc)
         logger.exception("Failed to notify admin for deposit %s: %s", deposit_id, exc)
+    try:
+        from services.admin_notification_log import log_admin_notification
+
+        log_admin_notification(
+            category="deposit_bank",
+            title="إيصال شحن جديد",
+            body_html=admin_caption,
+            severity="info",
+            entity_type="deposit",
+            entity_id=str(deposit_id),
+            user_id=user.id,
+            telegram_sent=telegram_sent,
+            telegram_error=telegram_error,
+            payload={
+                "deposit_id": deposit_id,
+                "bank_label": bank_label,
+                "proof_file_id": proof_file_id,
+            },
+        )
+    except Exception:
+        logger.exception("Failed to log admin deposit notification deposit_id=%s", deposit_id)
 
     await track_transcript_user_message(state, message)
     await edit_user_living_ui(

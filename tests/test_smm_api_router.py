@@ -20,7 +20,6 @@ os.environ.setdefault("SMM_KEY_TIKTOK", "tt-test-key")
 os.environ.setdefault("SMM_KEY_DEFAULT", "default-test-key")
 os.environ.setdefault("ADMIN_ID", "1")
 
-from config import SMM_API_KEYS, api_key_for_account
 from services import smm_api_router
 from services.smm_api_router import (
     clear_smm_manager_cache,
@@ -30,10 +29,22 @@ from services.smm_api_router import (
 from smm_api import SMMManager
 
 import database as db
+from services.provider_registry import clear_provider_caches, seed_default_gozibra_provider
 
 
 @pytest.fixture(autouse=True)
-def _reset_manager_cache() -> None:
+def _reset_manager_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    provider_db = tmp_path / "provider_registry_test.db"
+    monkeypatch.setattr("services.provider_registry.DB_PATH", provider_db)
+    import sqlite3
+
+    with sqlite3.connect(provider_db) as connection:
+        seed_default_gozibra_provider(connection)
+        connection.commit()
+    monkeypatch.setenv("SMM_KEY_INSTAGRAM", "ig-test-key")
+    monkeypatch.setenv("SMM_KEY_FACEBOOK", "fb-test-key")
+    monkeypatch.setenv("SMM_KEY_TIKTOK", "tt-test-key")
+    monkeypatch.setenv("SMM_KEY_DEFAULT", "default-test-key")
     clear_smm_manager_cache()
     yield
     clear_smm_manager_cache()
@@ -111,15 +122,14 @@ def test_instagram_wins_when_multiple_platform_keywords() -> None:
     assert creds["account_type"] == "instagram"
 
 
-def test_api_key_for_account_unknown_falls_back_to_default() -> None:
-    assert api_key_for_account("unknown_platform") == SMM_API_KEYS["default"]
-    assert api_key_for_account("") == SMM_API_KEYS["default"]
-
+def test_unknown_account_normalizes_to_default_credentials() -> None:
+    creds = get_provider_credentials("telegram", "members")
+    assert creds["account_type"] == "default"
+    assert creds["provider_slug"] == "gozibra"
 
 def test_get_provider_credentials_missing_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    import config
-
-    monkeypatch.setitem(config.SMM_API_KEYS, "instagram", "")
+    monkeypatch.setenv("SMM_KEY_INSTAGRAM", "")
+    clear_smm_manager_cache()
     with pytest.raises(RuntimeError, match="SMM_KEY_INSTAGRAM"):
         get_provider_credentials("instagram", "followers")
 
@@ -171,7 +181,7 @@ def test_clear_cache_allows_new_instance() -> None:
 
 def test_smm_manager_constructor_not_called_on_cache_hit() -> None:
     clear_smm_manager_cache()
-    with patch("services.smm_api_router.SMMManager") as mock_cls:
+    with patch("services.provider_registry.SMMManager") as mock_cls:
         mock_cls.return_value = MagicMock(spec=SMMManager)
         smm_manager_for_account("facebook")
         smm_manager_for_account("facebook")
@@ -266,8 +276,7 @@ async def _fetch_status_like_main(order: dict) -> dict:
     provider_order_id = order["provider_order_id"]
     if not provider_order_id:
         raise ValueError("missing provider_order_id")
-    account = str(order.get("api_account") or "default")
-    manager = smm_api_router.smm_manager_for_account(account)
+    manager = smm_api_router.smm_manager_for_order(order)
     return await manager.get_order_status(provider_order_id)
 
 
@@ -289,6 +298,7 @@ def test_status_check_routes_to_facebook_manager_not_default() -> None:
         "start_count": None,
         "status_note": None,
         "api_account": "facebook",
+        "provider_slug": "gozibra",
     }
 
     mock_fb = MagicMock(spec=SMMManager)
@@ -296,12 +306,12 @@ def test_status_check_routes_to_facebook_manager_not_default() -> None:
     mock_default = MagicMock(spec=SMMManager)
     mock_default.get_order_status = AsyncMock(return_value={"status": "Pending"})
 
-    def factory(account_type: str) -> SMMManager:
-        if account_type == "facebook":
+    def factory(order: dict) -> SMMManager:
+        if str(order.get("api_account")) == "facebook":
             return mock_fb
         return mock_default
 
-    with patch.object(smm_api_router, "smm_manager_for_account", side_effect=factory):
+    with patch.object(smm_api_router, "smm_manager_for_order", side_effect=factory):
         result = _run(_fetch_status_like_main(order))
 
     assert result["status"] == "Completed"
@@ -323,6 +333,7 @@ def test_status_check_legacy_order_without_api_account_uses_default() -> None:
         "start_count": None,
         "status_note": None,
         "api_account": "default",
+        "provider_slug": "gozibra",
     }
 
     mock_default = MagicMock(spec=SMMManager)
@@ -330,12 +341,12 @@ def test_status_check_legacy_order_without_api_account_uses_default() -> None:
     mock_ig = MagicMock(spec=SMMManager)
     mock_ig.get_order_status = AsyncMock()
 
-    def factory(account_type: str) -> SMMManager:
-        if account_type == "default":
+    def factory(order: dict) -> SMMManager:
+        if str(order.get("api_account")) == "default":
             return mock_default
         return mock_ig
 
-    with patch.object(smm_api_router, "smm_manager_for_account", side_effect=factory):
+    with patch.object(smm_api_router, "smm_manager_for_order", side_effect=factory):
         _run(_fetch_status_like_main(order))
 
     mock_default.get_order_status.assert_awaited_once_with("old_order_1")
@@ -368,10 +379,10 @@ def test_trackable_order_from_db_status_uses_stored_api_account(temp_db: Path) -
     mock_default = MagicMock(spec=SMMManager)
     mock_default.get_order_status = AsyncMock()
 
-    def factory(account_type: str) -> SMMManager:
-        return mock_fb if account_type == "facebook" else mock_default
+    def factory(order: dict) -> SMMManager:
+        return mock_fb if str(order.get("api_account")) == "facebook" else mock_default
 
-    with patch.object(smm_api_router, "smm_manager_for_account", side_effect=factory):
+    with patch.object(smm_api_router, "smm_manager_for_order", side_effect=factory):
         _run(_fetch_status_like_main(trackable[0]))
 
     mock_fb.get_order_status.assert_awaited_once_with("777")

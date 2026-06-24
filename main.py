@@ -36,10 +36,14 @@ from handlers.referrals import router as referrals_router
 from handlers.start import router as start_router
 from utils.smart_notification_middleware import SmartNotificationActivityMiddleware
 from utils.smart_notifications import router as smart_notifications_router, send_smart_notification
+from utils.message_deletions import run_deletion_worker
 from utils.timed_announcements import router as timed_announcements_router
 from utils.home_screen import ensure_welcome_upload_jpeg
-from services.smm_api_router import smm_manager_for_account
-from smm_api import ProviderAuthError, SMMManager
+from services.smm_api_router import smm_manager_for_order
+from services.provider_ops import verify_providers_at_startup
+from services.provider_price_sync import refresh_provider_prices
+from services.provider_catalog import refresh_all_provider_catalogs
+from smm_api import ProviderAuthError
 from utils.single_instance import acquire_bot_instance_lock
 
 logging.basicConfig(
@@ -47,7 +51,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
-smm_manager = SMMManager()
 MAX_START_RETRIES = 10
 BASE_RETRY_DELAY_SECONDS = 5
 TRACKING_INTERVAL_SECONDS = 60
@@ -239,8 +242,7 @@ async def _track_orders_and_refund(bot: Bot) -> None:
                 if not provider_order_id:
                     continue
                 try:
-                    account = str(order.get("api_account") or "default")
-                    status_data = await smm_manager_for_account(account).get_order_status(
+                    status_data = await smm_manager_for_order(order).get_order_status(
                         provider_order_id
                     )
                 except Exception as exc:
@@ -469,30 +471,71 @@ async def main() -> None:
         )
     # endregion
     try:
-        balance = await smm_manager.get_balance()
-        logger.info("SMM provider API credentials verified (balance=%s).", balance.get("balance"))
-        from services.provider_catalog import refresh_provider_catalog
-
-        if await refresh_provider_catalog(smm_manager, force=True):
-            logger.info("Provider service catalog (limits) cached at startup.")
+        startup = await verify_providers_at_startup()
+        if startup.success:
+            logger.info(
+                "Provider credentials verified: providers=%s accounts=%s balances_ok=%s",
+                startup.providers,
+                startup.accounts,
+                startup.balances_ok,
+            )
+        else:
+            logger.warning(
+                "Provider startup check incomplete: %s",
+                "; ".join(startup.errors) or "unknown",
+            )
+        refreshed = await refresh_all_provider_catalogs(force=True)
+        logger.info("Provider service catalog (limits) cached for %s account(s).", refreshed)
+        price_sync = await refresh_provider_prices(active_only=True)
+        if price_sync.success:
+            logger.info(
+                "Provider prices synced to DB: updated=%s unchanged=%s missing=%s",
+                price_sync.updated,
+                price_sync.unchanged,
+                price_sync.missing_in_api,
+            )
+        else:
+            logger.warning(
+                "Provider price sync incomplete: %s",
+                "; ".join(price_sync.errors) or "unknown",
+            )
     except ProviderAuthError as exc:
         logger.critical("SMM provider API key is invalid: %s", exc)
+        auth_body = (
+            "<b>⚠️ مفتاح API للمزود غير صالح</b>\n\n"
+            f"السبب: {escape(str(exc))}\n\n"
+            "حدّث مفاتيح المزوّد في ملف <code>.env</code> وجداول "
+            "<code>provider_accounts</code> ثم أعد تشغيل البوت.\n"
+            "لن تُنفَّذ الطلبات حتى تصحيح المفتاح."
+        )
+        telegram_sent = False
+        telegram_error: str | None = None
         try:
-            await send_smart_notification(
-                bot,
-                ADMIN_ID,
-                "<b>⚠️ مفتاح API للمزود غير صالح</b>\n\n"
-                f"السبب: {escape(str(exc))}\n\n"
-                "حدّث مفاتيح <code>SMM_KEY_*</code> في ملف <code>.env</code> من لوحة "
-                "<a href=\"https://gozibra.com\">gozibra.com</a> ثم أعد تشغيل البوت.\n"
-                "لن تُنفَّذ الطلبات حتى تصحيح المفتاح.",
+            await send_smart_notification(bot, ADMIN_ID, auth_body)
+            telegram_sent = True
+        except Exception as notify_exc:
+            telegram_error = str(notify_exc)
+            logger.exception("Failed to notify admin about invalid SMM API key")
+        try:
+            from services.admin_notification_log import log_admin_notification
+
+            log_admin_notification(
+                category="provider_auth",
+                title="مفتاح API للمزود غير صالح",
+                body_html=auth_body,
+                severity="critical",
+                entity_type="provider",
+                telegram_sent=telegram_sent,
+                telegram_error=telegram_error,
+                payload={"error": str(exc)},
             )
         except Exception:
-            logger.exception("Failed to notify admin about invalid SMM API key")
+            logger.exception("Failed to log provider auth admin notification")
     except Exception as exc:
         logger.warning("Could not verify SMM provider credentials at startup: %s", exc)
 
     tracker_task = asyncio.create_task(_track_orders_and_refund(bot))
+    deletion_task = asyncio.create_task(run_deletion_worker(bot))
     try:
         wh = await bot.get_webhook_info()
         logger.info(
@@ -541,7 +584,8 @@ async def main() -> None:
                 await asyncio.sleep(delay)
     finally:
         tracker_task.cancel()
-        await asyncio.gather(tracker_task, return_exceptions=True)
+        deletion_task.cancel()
+        await asyncio.gather(tracker_task, deletion_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

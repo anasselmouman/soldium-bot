@@ -56,17 +56,22 @@ async def send_timed_announcement_to_user(
     *,
     announcement_id: int,
     message_html: str,
+    auto_delete_seconds: int | None = None,
 ) -> bool:
     text = format_timed_announcement_text(message_html)
     markup = build_announce_dismiss_markup(announcement_id)
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=user_id,
             text=text,
             parse_mode="HTML",
             reply_markup=markup,
             disable_web_page_preview=True,
         )
+        if auto_delete_seconds is not None:
+            from utils.message_deletions import schedule_message_deletion
+
+            schedule_message_deletion(user_id, sent.message_id, auto_delete_seconds)
         return True
     except TelegramBadRequest as exc:
         logger.warning(
@@ -77,12 +82,16 @@ async def send_timed_announcement_to_user(
         )
         plain = text.replace("<b>", "").replace("</b>", "")
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 chat_id=user_id,
                 text=plain,
                 reply_markup=markup,
                 disable_web_page_preview=True,
             )
+            if auto_delete_seconds is not None:
+                from utils.message_deletions import schedule_message_deletion
+
+                schedule_message_deletion(user_id, sent.message_id, auto_delete_seconds)
             return True
         except TelegramBadRequest as exc2:
             logger.warning(
@@ -116,6 +125,7 @@ async def deliver_timed_announcements_on_entry(bot: Bot, user_id: int) -> int:
             user_id,
             announcement_id=int(item["id"]),
             message_html=str(item["message_html"]),
+            auto_delete_seconds=item.get("auto_delete_seconds"),
         )
         if ok:
             sent += 1

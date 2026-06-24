@@ -20,9 +20,9 @@ def test_subscriptions_services_marked_admin(tmp_path: Path) -> None:
         connection.execute(
             """
             INSERT INTO smm_services (
-                service_id, category, name_ar, provider_price_usd, platform_key,
-                section_key, local_item_id, fulfillment_mode
-            ) VALUES ('3986', 'per_unit', 'حساب 1 شهر', 3, 'subscriptions', 'iptv_wc2026', '3986', 'admin')
+                catalog_id, external_service_id, service_id, category, name_ar,
+                provider_price_usd, platform_key, section_key, local_item_id, fulfillment_mode
+            ) VALUES ('3986', '3986', '3986', 'per_unit', 'حساب 1 شهر', 3, 'subscriptions', 'iptv_wc2026', '3986', 'admin')
             """
         )
         connection.commit()

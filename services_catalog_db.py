@@ -58,15 +58,27 @@ def _fetch_active_rows() -> list[sqlite3.Row]:
 
 
 def _item_from_row(row: sqlite3.Row) -> dict[str, Any]:
-    service_id = str(row["service_id"])
-    local_id = str(row["local_item_id"] or service_id)
+    row_keys = row.keys()
+    catalog_id = str(row["catalog_id"]) if "catalog_id" in row_keys else str(row["service_id"])
+    external_id_raw = ""
+    if "external_service_id" in row_keys and row["external_service_id"]:
+        external_id_raw = str(row["external_service_id"]).strip()
+    else:
+        external_id_raw = str(row["service_id"]).strip()
+    local_id = str(row["local_item_id"] or catalog_id)
+    try:
+        provider_external_id = int(external_id_raw)
+    except (TypeError, ValueError):
+        provider_external_id = 0
     item: dict[str, Any] = {
         "id": local_id,
+        "catalog_id": catalog_id,
         "name": str(row["name_ar"] or ""),
         "price": float(row["local_price_dh"] or 0),
         "min": int(row["min_qty"] or 1),
         "max": int(row["max_qty"] or 0),
-        "provider_id": int(service_id),
+        "provider_id": provider_external_id,
+        "external_service_id": provider_external_id,
         "provider_rate_usd": float(row["provider_price_usd"] or 0),
     }
     if str(row["category"] or "") == "per_unit":
@@ -79,6 +91,14 @@ def _item_from_row(row: sqlite3.Row) -> dict[str, Any]:
         elif provider_usd > 0:
             item["price"] = round(provider_usd * SERVICE_USD_TO_DH_MULTIPLIER, 2)
     row_keys = row.keys()
+    from services.provider_registry import get_default_provider_slug
+
+    provider_slug = get_default_provider_slug()
+    if "provider_slug" in row_keys and row["provider_slug"]:
+        provider_slug = str(row["provider_slug"]).strip().lower() or provider_slug
+    item["provider_slug"] = provider_slug
+    if "provider_api_account" in row_keys and row["provider_api_account"]:
+        item["provider_account"] = str(row["provider_api_account"]).strip()
     fulfillment_mode = "auto"
     if "fulfillment_mode" in row_keys:
         fulfillment_mode = str(row["fulfillment_mode"] or "auto").strip().lower()
@@ -697,15 +717,28 @@ def reload_services_mapping(target: dict[str, Any]) -> None:
     target.update(fresh)
 
 
-def get_provider_limits_from_db(provider_id: int) -> tuple[int, int] | None:
+def get_provider_limits_from_db(
+    provider_slug: str,
+    external_service_id: int,
+) -> tuple[int, int] | None:
     try:
         with _get_connection() as conn:
             row = conn.execute(
-                "SELECT min_qty, max_qty FROM smm_services WHERE service_id = ?",
-                (str(provider_id),),
+                """
+                SELECT min_qty, max_qty FROM smm_services
+                WHERE provider_slug = ? AND external_service_id = ?
+                """,
+                (str(provider_slug).strip().lower(), str(external_service_id)),
             ).fetchone()
     except sqlite3.OperationalError:
-        return None
+        try:
+            with _get_connection() as conn:
+                row = conn.execute(
+                    "SELECT min_qty, max_qty FROM smm_services WHERE service_id = ?",
+                    (str(external_service_id),),
+                ).fetchone()
+        except sqlite3.OperationalError:
+            return None
     if not row:
         return None
     min_qty = int(row["min_qty"] or 1)
