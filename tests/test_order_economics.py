@@ -26,3 +26,16 @@ def test_from_service_dict() -> None:
         "price_per_unit": False,
     }
     assert provider_cost_dh_from_service(service, 2000) == 14.0
+
+
+def test_resolve_provider_cost_dh_uses_snapshot() -> None:
+    from utils.order_economics import resolve_provider_cost_dh_for_order
+
+    order = {"provider_cost_dh": 25.5, "service_id": "999", "quantity": 1000}
+    assert resolve_provider_cost_dh_for_order(order) == 25.5
+
+
+def test_resolve_provider_cost_dh_zero_without_snapshot_or_service() -> None:
+    from utils.order_economics import resolve_provider_cost_dh_for_order
+
+    assert resolve_provider_cost_dh_for_order({"quantity": 100}) == 0.0

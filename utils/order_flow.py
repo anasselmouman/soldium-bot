@@ -321,6 +321,16 @@ def _strip_tags_for_short(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
+def _truncate_link_for_invoice(link: str, *, max_len: int = 72) -> str:
+    """عرض مختصر للرابط في فاتورة التأكيد حتى لا يطغى على باقي التفاصيل."""
+    text = link.strip()
+    if not text:
+        return "—"
+    if len(text) <= max_len:
+        return escape(text)
+    return escape(f"{text[: max_len - 1]}…")
+
+
 def build_invoice_text(
     service: dict,
     currency_display: str,
@@ -332,24 +342,29 @@ def build_invoice_text(
     breadcrumb_line: str | None = None,
 ) -> str:
     quantity_text = f"{quantity} (ثابتة تلقائياً)" if is_fixed_quantity else str(quantity)
-    link_display = escape(link.strip()) if link.strip() else "—"
+    link_display = _truncate_link_for_invoice(link)
+    total_display = f"{format_amount(total_price)} {currency_display}"
     price_line = format_service_price_per_1000(service, currency_display)
     notice_text = resolve_service_notice(service, short=False)
     notice_block = ""
     if notice_text:
         notice_block = f"\n\n{format_service_note_html(notice_text)}"
+    sep = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
     body = (
-        "<b>مراجعة الطلب قبل التأكيد</b>\n"
-        "تأكد من أن كل المعلومات صحيحة قبل الضغط على زر تأكيد الطلب.\n"
-        "<blockquote>"
-        f"اسم الخدمة: <b>{escape(str(service['name']))}</b>\n"
-        f"الرابط: <code>{link_display}</code>\n"
-        f"الكمية: <b>{quantity_text}</b>\n"
-        f"ثمن الخدمة: <b>{price_line}</b>\n"
-        f"المبلغ الذي سيتم خصمه: <b>{format_amount(total_price)} {currency_display}</b>"
-        "</blockquote>"
+        f"{sep}\n"
+        "📋 <b>SOLDIUM | مراجعة الطلب قبل التأكيد</b>\n"
+        f"{sep}\n\n"
+        f"💰 <b>التكلفة الإجمالية:</b> <code>{escape(total_display)}</code>\n\n"
+        "تأكد من صحة المعلومات ثم اضغط <b>تأكيد الطلب</b> ✅\n\n"
+        f"{sep}\n"
+        f"🛍️ <b>اسم الخدمة:</b> {escape(str(service['name']))}\n"
+        f"🔗 <b>الرابط:</b> <code>{link_display}</code>\n"
+        f"📦 <b>الكمية:</b> <b>{quantity_text}</b>\n"
+        f"💵 <b>ثمن الخدمة:</b> <b>{price_line}</b>\n"
+        f"💳 <b>المبلغ الذي سيتم خصمه:</b> <b>{escape(total_display)}</b>\n"
+        f"{sep}"
         f"{notice_block}\n\n"
-        "بعد التأكيد يبدأ تنفيذ الطلب ولا يمكن تعديل الرابط أو الكمية من هنا."
+        "⚠️ بعد التأكيد يبدأ تنفيذ الطلب ولا يمكن تعديل الرابط أو الكمية من هنا."
     )
     if breadcrumb_line:
         return f"{breadcrumb_line}\n\n{body}"

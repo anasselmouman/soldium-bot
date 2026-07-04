@@ -73,6 +73,7 @@ class OrderRecord(TypedDict):
     id: int
     user_id: int
     service_name: str
+    service_id: str
     quantity: int
     amount: float
     status: str
@@ -83,6 +84,7 @@ class OrderRecord(TypedDict):
     status_note: str | None
     api_account: str
     provider_slug: str
+    provider_cost_dh: float
 
 
 def _order_row_to_record(row: sqlite3.Row) -> OrderRecord:
@@ -103,10 +105,17 @@ def _order_row_to_record(row: sqlite3.Row) -> OrderRecord:
             provider_slug = get_default_provider_slug()
         except Exception:
             provider_slug = "gozibra"
+    service_id = ""
+    if "service_id" in keys and row["service_id"] is not None:
+        service_id = str(row["service_id"])
+    provider_cost_dh = 0.0
+    if "provider_cost_dh" in keys and row["provider_cost_dh"] is not None:
+        provider_cost_dh = float(row["provider_cost_dh"])
     return {
         "id": int(row["id"]),
         "user_id": int(row["user_id"]),
         "service_name": str(row["service_name"]),
+        "service_id": service_id,
         "link": str(row["link"] or ""),
         "quantity": int(row["quantity"]),
         "amount": float(row["amount"]),
@@ -119,6 +128,7 @@ def _order_row_to_record(row: sqlite3.Row) -> OrderRecord:
         "status_note": status_note,
         "api_account": api_account,
         "provider_slug": provider_slug,
+        "provider_cost_dh": provider_cost_dh,
     }
 
 
@@ -1410,8 +1420,8 @@ def get_user_orders(user_id: int, limit: int = 10) -> list[OrderRecord]:
     with get_connection() as connection:
         rows = connection.execute(
             """
-            SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
-                   start_count, created_at, status_note, api_account, provider_slug
+            SELECT id, user_id, service_name, service_id, link, quantity, amount, status, provider_order_id,
+                   start_count, created_at, status_note, api_account, provider_slug, provider_cost_dh
             FROM orders
             WHERE user_id = ?
             ORDER BY id DESC
@@ -1430,8 +1440,8 @@ def search_user_orders(user_id: int, query: str) -> list[OrderRecord]:
     with get_connection() as connection:
         rows = connection.execute(
             """
-            SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
-                   start_count, created_at, status_note, api_account, provider_slug
+            SELECT id, user_id, service_name, service_id, link, quantity, amount, status, provider_order_id,
+                   start_count, created_at, status_note, api_account, provider_slug, provider_cost_dh
             FROM orders
             WHERE user_id = ?
               AND (
@@ -1450,8 +1460,8 @@ def get_last_orders(limit: int = 10) -> list[OrderRecord]:
     with get_connection() as connection:
         rows = connection.execute(
             """
-            SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
-                   start_count, created_at, status_note, api_account, provider_slug
+            SELECT id, user_id, service_name, service_id, link, quantity, amount, status, provider_order_id,
+                   start_count, created_at, status_note, api_account, provider_slug, provider_cost_dh
             FROM orders
             ORDER BY id DESC
             LIMIT ?
@@ -1704,8 +1714,8 @@ def get_pending_admin_orders_ordered() -> list[OrderRecord]:
     with get_connection() as connection:
         rows = connection.execute(
             """
-            SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
-                   start_count, created_at, status_note, api_account, provider_slug
+            SELECT id, user_id, service_name, service_id, link, quantity, amount, status, provider_order_id,
+                   start_count, created_at, status_note, api_account, provider_slug, provider_cost_dh
             FROM orders
             WHERE LOWER(REPLACE(status, '_', ' ')) = 'pending admin'
             ORDER BY id ASC
@@ -1730,8 +1740,8 @@ def get_trackable_orders(limit: int = 200) -> list[OrderRecord]:
     with get_connection() as connection:
         rows = connection.execute(
             """
-            SELECT id, user_id, service_name, link, quantity, amount, status, provider_order_id,
-                   start_count, created_at, status_note, api_account, provider_slug
+            SELECT id, user_id, service_name, service_id, link, quantity, amount, status, provider_order_id,
+                   start_count, created_at, status_note, api_account, provider_slug, provider_cost_dh
             FROM orders
             WHERE provider_order_id IS NOT NULL
               AND provider_order_id != ''

@@ -19,7 +19,9 @@ from utils.order_status_ar import (
     is_order_in_execution_status,
     normalize_order_status_key,
 )
-from utils.partial_refund_math import compute_partial_refund_from_status
+from config import SERVICE_USD_TO_DH_MULTIPLIER
+from utils.order_economics import resolve_provider_cost_dh_for_order
+from utils.partial_refund_math import compute_partial_refund
 from utils.smart_notifications import send_smart_notification
 
 logger = logging.getLogger(__name__)
@@ -113,10 +115,12 @@ async def apply_provider_status_to_order(
         return load_order_sync_snapshot(order_id)
 
     if provider_status_lower == "partial":
-        computed = compute_partial_refund_from_status(
-            order["amount"],
-            int(order["quantity"]),
-            status_data,
+        resolved_provider_cost = resolve_provider_cost_dh_for_order(order)
+        computed = compute_partial_refund(
+            amount_paid_dh=order["amount"],
+            quantity=int(order["quantity"]),
+            status_data=status_data,
+            provider_cost_dh=resolved_provider_cost,
         )
         if computed is None:
             logger.warning(
@@ -133,6 +137,10 @@ async def apply_provider_status_to_order(
         audit_payload = json.dumps(
             {
                 "calc_method": calc_method,
+                "provider_cost_dh_snapshot": float(order.get("provider_cost_dh") or 0),
+                "provider_cost_dh_resolved": resolved_provider_cost,
+                "amount_paid": float(order["amount"]),
+                "usd_to_dh": SERVICE_USD_TO_DH_MULTIPLIER,
                 "provider_status": status_data.get("status"),
                 "cost": status_data.get("cost"),
                 "charge": status_data.get("charge"),

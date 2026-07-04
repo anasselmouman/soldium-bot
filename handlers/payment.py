@@ -1487,18 +1487,6 @@ async def withdraw_confirm_handler(callback: CallbackQuery, state: FSMContext, b
     await _edit_payment_from_callback(
         callback, state, bot, text=text, reply_markup=markup
     )
-    from services.withdraw_admin_notify import notify_admin_new_withdrawal
-
-    await notify_admin_new_withdrawal(
-        bot,
-        withdrawal_id=withdrawal_id,
-        user_id=callback.from_user.id,
-        telegram_name=callback.from_user.full_name,
-        amount=amount,
-        method_label=method.ledger_name,
-        details_json=details_json,
-        withdrawal_type="normal",
-    )
     # region agent log
     _withdraw_debug_log(
         "handlers/payment.py:withdraw_confirm_handler",

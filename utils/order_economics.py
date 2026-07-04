@@ -60,3 +60,28 @@ def provider_cost_dh_from_service(service: dict, quantity: int) -> float:
         local_price_dh=float(service.get("price") or 0),
         price_per_unit=bool(service.get("price_per_unit")),
     )
+
+
+def resolve_provider_cost_dh_for_order(order: dict) -> float:
+    """
+    تكلفة المورد للطلب: snapshot محفوظ، أو إعادة بناء من الكتالوج، أو 0.
+    """
+    snapshot = float(order.get("provider_cost_dh") or 0)
+    if snapshot > 0:
+        return snapshot
+
+    service_id = str(order.get("service_id") or "").strip()
+    if not service_id:
+        return 0.0
+
+    try:
+        from utils.services import find_service_by_id
+
+        service = find_service_by_id(service_id)
+    except Exception:
+        service = None
+    if not service:
+        return 0.0
+
+    quantity = max(int(order.get("quantity") or 1), 1)
+    return provider_cost_dh_from_service(service, quantity)

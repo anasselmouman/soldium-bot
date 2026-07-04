@@ -1183,18 +1183,6 @@ async def referral_withdraw_confirm_handler(callback: CallbackQuery, state: FSMC
         reply_markup=pending_menu,
     )
     await _finish_referral_flow(bot, state, user_id, chat_id)
-    from services.withdraw_admin_notify import notify_admin_new_withdrawal
-
-    await notify_admin_new_withdrawal(
-        bot,
-        withdrawal_id=withdrawal_id,
-        user_id=user_id,
-        telegram_name=callback.from_user.full_name,
-        amount=amount,
-        method_label=method.ledger_name,
-        details_json=details_json,
-        withdrawal_type="referral",
-    )
     await callback.answer()
 
 

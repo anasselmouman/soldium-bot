@@ -441,26 +441,27 @@ def _build_order_success_receipt_html(
 
     ref = escape(str(provider_order_ref).strip()) if str(provider_order_ref).strip() else "—"
     sep = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
-    body = (
-        f"{sep}\n"
-        "<b>تم إنشاء الطلب بنجاح</b>\n"
-        f"{sep}\n"
-        f"• <b>رقم الطلب:</b> <code>{ref}</code>\n"
-        f"• <b>الرابط:</b> <code>{escape(link)}</code>\n"
-        f"• <b>الكمية:</b> <code>{quantity}</code>\n"
-        f"• <b>التكلفة:</b> <code>{escape(str(total_price_display))} DH</code>\n"
-    )
     if admin_fulfillment:
-        body += (
-            "• <b>حالة الطلب:</b> بانتظار تنفيذ الإدارة — ستصلك التفاصيل قريباً.\n"
+        status_line = (
+            "⏳ <b>الحالة:</b> بانتظار تنفيذ الإدارة — ستصلك التفاصيل قريباً. 🔔"
         )
     else:
-        body += (
-            "• <b>حالة الطلب:</b> تم إرساله للتنفيذ وهو الآن قيد المعالجة.\n"
+        status_line = (
+            "🚀 <b>الحالة:</b> تم إرساله للتنفيذ وهو الآن قيد المعالجة. 🔄"
         )
-    body += (
+    body = (
         f"{sep}\n"
-        "يمكنك متابعة حالته من قسم [ طلباتي ] داخل [ حسابي ]. احتفظ برقم الطلب عند التواصل مع الدعم."
+        "✅🎉 <b>SOLDIUM | تم تسجيل طلبك بنجاح!</b> 🎉✅\n"
+        f"{sep}\n\n"
+        "شكراً لثقتك بنا — طلبك في أيدٍ أمينة 💚\n\n"
+        f"🆔 <b>رقم الطلب:</b> <code>{ref}</code>\n"
+        f"🔗 <b>الرابط:</b> <code>{escape(link)}</code>\n"
+        f"📦 <b>الكمية:</b> <code>{quantity}</code>\n"
+        f"💳 <b>التكلفة:</b> <code>{escape(str(total_price_display))} DH</code>\n"
+        f"{status_line}\n\n"
+        f"{sep}\n"
+        "📌 تابع حالة طلبك من قسم <b>طلباتي</b> داخل <b>حسابي</b>.\n"
+        "✅ احتفظ برقم الطلب عند التواصل مع الدعم."
     )
     if breadcrumb_line:
         return f"{breadcrumb_line}\n\n{body}"
@@ -2339,7 +2340,7 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         state,
         user_id=user_id,
         service_name=str(service["name"]),
-        step_label="تم الطلب",
+        step_label="✅ تم الطلب",
     )
     flow_data = await state.get_data()
     services_return_ctx = {

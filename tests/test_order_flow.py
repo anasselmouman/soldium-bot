@@ -264,3 +264,15 @@ def test_build_invoice_text_for_fixed_quantity():
     assert "Auto Service" in text
     assert "ثابتة تلقائياً" in text
     assert link in text
+    assert "التكلفة الإجمالية" in text
+    assert text.index("التكلفة الإجمالية") < text.index("اسم الخدمة")
+    assert text.count("4 DH") >= 2
+
+
+def test_build_invoice_text_truncates_long_link():
+    service = {"name": "Test Service", "price": 10}
+    link = "https://example.com/" + ("a" * 120)
+    text = build_invoice_text(service, "DH", 500, 5, link)
+    assert "التكلفة الإجمالية" in text
+    assert link not in text
+    assert "…" in text

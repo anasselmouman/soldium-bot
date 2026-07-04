@@ -70,8 +70,33 @@ def test_sync_partial_refunds_invitee_and_pays_referrer(tmp_path: Path) -> None:
     referrer = db.get_user(1000)
     assert invitee is not None
     assert referrer is not None
+    # legacy ×22: refund 89, balance 189, referral on net 11 → 1.1
     assert float(invitee["balance"]) == 189.0
     assert float(referrer["referral_balance"]) == 1.1
+
+
+def test_sync_partial_margin_proportional_with_snapshot(tmp_path: Path) -> None:
+    _referrer_and_invitee(tmp_path)
+    order = _grant_and_order(2000, 100.0, quantity=1000)
+    order_id = int(order["id"])
+    with db.get_connection() as connection:
+        connection.execute(
+            "UPDATE orders SET provider_cost_dh = ? WHERE id = ?",
+            (14.0, order_id),
+        )
+        connection.commit()
+    order = dict(db.get_user_orders(2000, limit=1)[0])
+    status_data = {"status": "Partial", "charge": "0.5", "remains": "500"}
+
+    _run(apply_provider_status_to_order(order, status_data, None, notify=False))
+
+    invitee = db.get_user(2000)
+    referrer = db.get_user(1000)
+    assert invitee is not None
+    assert referrer is not None
+    # margin proportional: final 50, refund 50, balance 150, referral net 50 → 5.0
+    assert float(invitee["balance"]) == 150.0
+    assert float(referrer["referral_balance"]) == 5.0
 
 
 def test_sync_failed_full_refund_no_referral(tmp_path: Path) -> None:
