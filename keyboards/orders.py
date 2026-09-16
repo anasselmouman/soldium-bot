@@ -9,10 +9,15 @@ from keyboards.nav_labels import (
     order_back_button_label,
     order_nav_controls_count,
 )
-from services_config import SERVICES
+from storefront import navigation_tree
 from utils.money import format_amount
 
 # --- 1. الدوال المساعدة (Internal Helpers) ---
+
+def _services() -> dict:
+    """Storefront-backed Legacy-shaped tree (Phase 9Q)."""
+    return navigation_tree()
+
 
 def _service_button_text(item: dict) -> str:
     """تنسيق نص زر الخدمة مع السعر بوضوح"""
@@ -60,6 +65,14 @@ def build_order_insufficient_balance_keyboard() -> InlineKeyboardMarkup:
     builder.button(text=BTN_MAIN_HOME, callback_data=CB_MENU_HOME)
     builder.button(text=BTN_BACK_STEP, callback_data="order:nav:back")
     builder.adjust(1, 2)
+    return builder.as_markup()
+
+
+def build_order_active_link_occupied_keyboard() -> InlineKeyboardMarkup:
+    """تنقل عند رفض الطلب لأن الرابط مشغول بطلب نشط."""
+    builder = InlineKeyboardBuilder()
+    _append_standard_controls(builder, "order:nav:back")
+    builder.adjust(2)
     return builder.as_markup()
 
 
@@ -124,7 +137,7 @@ def build_order_critical_points_markup() -> InlineKeyboardMarkup:
 def build_sections_menu(platform_key: str) -> InlineKeyboardMarkup:
     """قائمة الأقسام الرئيسية داخل منصة معينة"""
     builder = InlineKeyboardBuilder()
-    category = SERVICES.get(platform_key, {})
+    category = _services().get(platform_key, {})
     sections = category.get("sections") or {}
     
     # إضافة الأقسام
@@ -156,7 +169,7 @@ def build_sections_menu(platform_key: str) -> InlineKeyboardMarkup:
 def build_subsections_menu(platform_key: str, section_key: str) -> InlineKeyboardMarkup:
     """قائمة الأقسام الفرعية أو الخدمات داخل القسم"""
     builder = InlineKeyboardBuilder()
-    platform_data = SERVICES.get(platform_key, {})
+    platform_data = _services().get(platform_key, {})
     section = platform_data.get("sections", {}).get(section_key, {})
     
     # 1. الخدمات المباشرة في هذا القسم
@@ -183,7 +196,7 @@ def build_subsections_menu(platform_key: str, section_key: str) -> InlineKeyboar
 def build_services_menu(platform_key: str, section_key: str | None, subsection_key: str | None = None) -> InlineKeyboardMarkup:
     """القائمة النهائية لعرض الخدمات للاختيار"""
     builder = InlineKeyboardBuilder()
-    category = SERVICES.get(platform_key, {})
+    category = _services().get(platform_key, {})
     sections = category.get("sections") or {}
     section = sections.get(section_key) if section_key else {}
     

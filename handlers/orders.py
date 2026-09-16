@@ -16,6 +16,11 @@ from database import (
     refund_order,
     set_provider_order_id,
 )
+from utils.active_link_guard import (
+    ACTIVE_LINK_OCCUPIED_MESSAGE,
+    ActiveLinkOccupiedError,
+    find_active_order_for_link,
+)
 from keyboards.main import build_main_menu
 from keyboards.orders import (
     build_flow_navigation_keyboard,
@@ -24,6 +29,7 @@ from keyboards.orders import (
     build_services_menu,
     build_order_confirm_keyboard,
     build_order_insufficient_balance_keyboard,
+    build_order_active_link_occupied_keyboard,
     build_order_success_nav_keyboard,
     build_platforms_menu,
     build_order_critical_points_markup,
@@ -33,10 +39,15 @@ from keyboards.orders import (
 )
 from utils.critical_points import build_critical_points_html
 from utils.ui_branding import ACCOUNT_PERSISTENCE_HTML
-from services_config import SERVICES, reload_services
+from storefront import get_storefront, navigation_tree
 from smm_api import ProviderAuthError
 from utils.money import format_amount_2, to_decimal, to_float
 from utils.order_economics import provider_cost_dh_from_service
+
+
+def _services():
+    """Storefront navigation tree — no direct backend selection in handlers."""
+    return navigation_tree()
 from utils.flow_transcript import (
     acknowledge_then_focus_living_ui,
     delete_flow_step_prompt,
@@ -191,15 +202,15 @@ def _trail_from_order_context(
     parts: list[str] = []
     pk = str(platform_key or "").strip()
     if pk:
-        category = SERVICES.get(pk) or {}
+        category = _services().get(pk) or {}
         parts.append(str(category.get("title", pk)))
     sk = str(section_key or "").strip()
     if sk and sk.lower() not in {"none", "direct", ""}:
-        section = ((SERVICES.get(pk) or {}).get("sections") or {}).get(sk) or {}
+        section = ((_services().get(pk) or {}).get("sections") or {}).get(sk) or {}
         parts.append(str(section.get("title", sk)))
     ssk = str(subsection_key or "").strip()
     if ssk and pk and sk:
-        section = ((SERVICES.get(pk) or {}).get("sections") or {}).get(sk) or {}
+        section = ((_services().get(pk) or {}).get("sections") or {}).get(sk) or {}
         subsection = (section.get("subsections") or {}).get(ssk) or {}
         parts.append(str(subsection.get("title", ssk)))
     if service_name:
@@ -469,17 +480,28 @@ def _build_order_success_receipt_html(
 
 
 async def _submit_order_to_provider(
-    service: dict,
+    *,
+    external_service_id: str,
     link: str,
     quantity: int,
     api_account: str,
     provider_slug: str,
 ) -> str:
+    from utils.order_execution_identity import (
+        InvalidProviderExternalServiceId,
+        encode_provider_external_service_id_for_wire,
+    )
+
+    try:
+        wire_service_id = encode_provider_external_service_id_for_wire(external_service_id)
+    except InvalidProviderExternalServiceId as exc:
+        raise ValueError(str(exc)) from exc
+
     provider_response = await smm_manager_for_account(
         api_account,
         provider_slug,
     ).add_order(
-        service=int(service["provider_id"]),
+        service=wire_service_id,
         link=link,
         quantity=quantity,
     )
@@ -798,7 +820,7 @@ async def _show_platforms(
     message: Message | None = None,
     use_edit: bool = False,
 ) -> None:
-    reload_services()
+    get_storefront().refresh()
     await state.set_state(OrderFlow.choose_category)
     await state.update_data(platform_key=None, section_key=None, subsection_key=None, service_id=None, parent_section_key=None)
     markup = build_platforms_menu()
@@ -844,7 +866,7 @@ async def _show_sections(
     message: Message | None = None,
     use_edit: bool = False,
 ) -> None:
-    category = SERVICES.get(platform_key, {})
+    category = _services().get(platform_key, {})
     sections = category.get("sections") or {}
     warn_markup = build_flow_navigation_keyboard("order:nav:platforms")
     if not sections:
@@ -904,7 +926,7 @@ async def _show_services(
         )
         return
 
-    category = SERVICES.get(platform_key, {})
+    category = _services().get(platform_key, {})
     is_direct = section_key is None or str(section_key).lower() in {"none", "direct", ""}
 
     trail = _trail_from_order_context(
@@ -1025,7 +1047,7 @@ async def _show_subsections(
     message: Message | None = None,
     use_edit: bool = False,
 ) -> None:
-    category = SERVICES.get(platform_key, {})
+    category = _services().get(platform_key, {})
     sections = category.get("sections") or {}
     section = sections.get(section_key) or {}
     if not section.get("subsections"):
@@ -1178,7 +1200,7 @@ async def handle_platform_selection(callback: CallbackQuery, state: FSMContext, 
     if user_id is None:
         return
     platform_key = callback.data.split(":")[-1]
-    category = SERVICES.get(platform_key, {})
+    category = _services().get(platform_key, {})
     await state.update_data(platform_key=platform_key)
     if not category.get("sections") and category.get("direct_items"):
         await _show_services(
@@ -1222,7 +1244,7 @@ async def order_choose_section_callback(
         await callback.answer("تصنيف غير صالح", show_alert=True)
         return
     _, _, platform_key, section_key = parts
-    sections = (SERVICES.get(platform_key, {}) or {}).get("sections") or {}
+    sections = (_services().get(platform_key, {}) or {}).get("sections") or {}
     if section_key not in sections:
         await callback.answer("تصنيف غير صالح", show_alert=True)
         return
@@ -1271,14 +1293,14 @@ async def order_choose_subsection_callback(
         await callback.answer("تصنيف فرعي غير صالح", show_alert=True)
         return
     platform_key, section_key, subsection_key = parsed
-    section = ((SERVICES.get(platform_key, {}) or {}).get("sections") or {}).get(section_key) or {}
+    section = ((_services().get(platform_key, {}) or {}).get("sections") or {}).get(section_key) or {}
     subsections = section.get("subsections") or {}
     if subsection_key not in subsections:
         await callback.answer("تصنيف فرعي غير صالح", show_alert=True)
         return
     redirect_section_key = str(subsections[subsection_key].get("redirect_section", "")).strip()
     if redirect_section_key:
-        redirect_section = ((SERVICES.get(platform_key, {}) or {}).get("sections") or {}).get(redirect_section_key) or {}
+        redirect_section = ((_services().get(platform_key, {}) or {}).get("sections") or {}).get(redirect_section_key) or {}
         if not redirect_section:
             await callback.answer("التصنيف غير متاح حالياً", show_alert=True)
             return
@@ -1322,7 +1344,7 @@ async def legacy_subsection_callback(callback: CallbackQuery, state: FSMContext,
     if user_id is None:
         return
     _, platform_key, section_key, subsection_key = callback.data.split(":")
-    section = ((SERVICES.get(platform_key, {}) or {}).get("sections") or {}).get(section_key) or {}
+    section = ((_services().get(platform_key, {}) or {}).get("sections") or {}).get(section_key) or {}
     subsections = section.get("subsections") or {}
     subsection = subsections.get(subsection_key) or {}
     if not subsection:
@@ -1364,7 +1386,7 @@ async def legacy_back_to_platform_handler(callback: CallbackQuery, state: FSMCon
     if user_id is None:
         return
     platform_key = callback.data.split(":")[1].strip()
-    if platform_key in SERVICES:
+    if platform_key in _services():
         await _show_sections(
             state,
             platform_key,
@@ -1718,7 +1740,7 @@ async def order_nav_home(callback: CallbackQuery, state: FSMContext, bot: Bot) -
 
 def _platform_landing_is_sections(platform_key: str) -> bool:
     """المنصة التي تملك أصنافاً تكون شاشة هبوطها قائمة الأصناف (التي تتضمن الخدمات المباشرة)."""
-    return bool((SERVICES.get(platform_key, {}) or {}).get("sections"))
+    return bool((_services().get(platform_key, {}) or {}).get("sections"))
 
 
 async def _show_platform_landing(
@@ -1771,7 +1793,7 @@ async def _navigate_back_to_services_list(
         )
         return
     if has_real_section:
-        section = ((SERVICES.get(platform_key, {}) or {}).get("sections") or {}).get(section_key) or {}
+        section = ((_services().get(platform_key, {}) or {}).get("sections") or {}).get(section_key) or {}
         if section.get("subsections"):
             await _show_subsections(
                 state,
@@ -1882,7 +1904,7 @@ async def _handle_back_navigation(callback: CallbackQuery, state: FSMContext, bo
     if current_state == OrderFlow.choose_service.state:
         await delete_flow_step_prompt(bot, state, chat_id)
         has_real_section = section_key.lower() not in {"", "none", "direct"}
-        section = ((SERVICES.get(platform_key, {}) or {}).get("sections") or {}).get(section_key) if has_real_section else {}
+        section = ((_services().get(platform_key, {}) or {}).get("sections") or {}).get(section_key) if has_real_section else {}
         if has_real_section and (subsection_key or section.get("subsections")):
             await _show_subsections(
                 state,
@@ -2022,7 +2044,7 @@ async def auto_disclaimer_cancel_callback(callback: CallbackQuery, state: FSMCon
     data = await state.get_data()
     platform_key = str(data.get("platform_key", ""))
     section_key = str(data.get("section_key", ""))
-    if platform_key in SERVICES and section_key:
+    if platform_key in _services() and section_key:
         await _show_subsections(
             state,
             platform_key,
@@ -2179,33 +2201,127 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
     api_account = provider_creds["account_type"]
     provider_slug = provider_creds["provider_slug"]
     snapshot_provider_cost = provider_cost_dh_from_service(service, quantity)
+    # Phase 8G — freeze execution identity before persist/submit (TEXT, no int).
+    external_snap = str(service.get("external_service_id_text") or "").strip()
+    if not external_snap:
+        # Do not invent from local_item_id / catalog_id equality coincidence.
+        raw_ext = service.get("external_service_id")
+        if raw_ext is not None and str(raw_ext).strip() and str(raw_ext).strip() != "0":
+            external_snap = str(raw_ext).strip()
+    legacy_catalog_id = str(service.get("catalog_id") or "").strip()
+    if not external_snap:
+        await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+        await _edit_order_result(
+            callback,
+            state,
+            bot,
+            user_id,
+            "<b>تعذر تنفيذ الطلب:</b> معرّف تنفيذ المزوّد غير متوفر لهذه الخدمة.",
+            _home(user_id),
+        )
+        await callback.answer()
+        return
 
-    if requires_admin:
-        order_id = create_order_with_balance_hold(
+    create_kwargs = dict(
+        user_id=user_id,
+        service_name=str(service["name"]),
+        service_id=str(service["id"]),
+        link=link,
+        quantity=quantity,
+        amount=to_float(total_price),
+        api_account=api_account,
+        provider_slug=provider_slug,
+        provider_cost_dh=snapshot_provider_cost,
+        catalog_id=legacy_catalog_id or None,
+        external_service_id_snapshot=external_snap,
+    )
+
+    # Phase 9Q / controlled pilot — Catalog Order Intent for Catalog-routed services.
+    # Default production backend is Legacy; pilot uses uses_catalog_order_contract.
+    storefront = get_storefront()
+    use_catalog_contract = storefront.backend_name == "catalog" or (
+        hasattr(storefront, "uses_catalog_order_contract")
+        and storefront.uses_catalog_order_contract(str(service["id"]))
+    )
+    if use_catalog_contract:
+        from catalog_core.storefront_adapter import StorefrontAdapterError
+        from storefront import order_intent_to_create_bridge
+
+        try:
+            intent = storefront.resolve_order_intent(
+                str(service["id"]), quantity, target=link
+            )
+            bridge = order_intent_to_create_bridge(intent, user_id=user_id)
+            create_kwargs = bridge.to_create_kwargs()
+            create_kwargs["provider_cost_dh"] = snapshot_provider_cost
+            external_snap = bridge.external_service_id_snapshot
+            api_account = bridge.api_account
+            provider_slug = bridge.provider_slug
+            total_price = to_decimal(bridge.amount_dh)
+            requires_admin = str(bridge.fulfillment_mode).lower() == "admin"
+        except StorefrontAdapterError as exc:
+            await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+            await _edit_order_result(
+                callback,
+                state,
+                bot,
+                user_id,
+                f"<b>تعذر تجهيز الطلب من الكتالوج:</b>\n{exc}",
+                _home(user_id),
+            )
+            await callback.answer()
+            return
+
+    # Active-link guard: block before balance hold / provider submission.
+    # Keep OrderFlow.confirm_order so «رجوع» returns to quantity/link via order:nav:back.
+    from database import get_connection
+
+    with get_connection() as _conn:
+        occupied = find_active_order_for_link(_conn, link)
+    if occupied is not None:
+        header = await _order_breadcrumb_from_state(
+            state,
             user_id=user_id,
             service_name=str(service["name"]),
-            service_id=str(service["id"]),
-            link=link,
-            quantity=quantity,
-            amount=to_float(total_price),
-            api_account=api_account,
-            provider_slug=provider_slug,
-            initial_status="pending_admin",
-            fulfillment_mode=FULFILLMENT_ADMIN,
-            provider_cost_dh=snapshot_provider_cost,
+            step_label="تأكيد الطلب",
         )
-    else:
-        order_id = create_order_with_balance_hold(
+        await _edit_order_result(
+            callback,
+            state,
+            bot,
+            user_id,
+            f"{header}\n\n{ACTIVE_LINK_OCCUPIED_MESSAGE}",
+            build_order_active_link_occupied_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    try:
+        if requires_admin:
+            order_id = create_order_with_balance_hold(
+                **create_kwargs,
+                initial_status="pending_admin",
+                fulfillment_mode=FULFILLMENT_ADMIN,
+            )
+        else:
+            order_id = create_order_with_balance_hold(**create_kwargs)
+    except ActiveLinkOccupiedError:
+        header = await _order_breadcrumb_from_state(
+            state,
             user_id=user_id,
             service_name=str(service["name"]),
-            service_id=str(service["id"]),
-            link=link,
-            quantity=quantity,
-            amount=to_float(total_price),
-            api_account=api_account,
-            provider_slug=provider_slug,
-            provider_cost_dh=snapshot_provider_cost,
+            step_label="تأكيد الطلب",
         )
+        await _edit_order_result(
+            callback,
+            state,
+            bot,
+            user_id,
+            f"{header}\n\n{ACTIVE_LINK_OCCUPIED_MESSAGE}",
+            build_order_active_link_occupied_keyboard(),
+        )
+        await callback.answer()
+        return
     if not order_id:
         header = await _order_breadcrumb_from_state(
             state,
@@ -2228,11 +2344,11 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
 
     try:
         provider_order_id = await _submit_order_to_provider(
-            service,
-            link,
-            quantity,
-            api_account,
-            provider_slug,
+            external_service_id=external_snap,
+            link=link,
+            quantity=quantity,
+            api_account=api_account,
+            provider_slug=provider_slug,
         )
         if requires_admin:
             assign_provider_order_id(order_id, provider_order_id)
@@ -2317,7 +2433,7 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         user_record = get_user(user_id)
         trail = _trail_from_order_context(platform_key, section_key, subsection_key)
         order_type_label = " › ".join(trail) if trail else str(service["name"])
-        platform_meta = SERVICES.get(platform_key, {}) or {}
+        platform_meta = _services().get(platform_key, {}) or {}
         platform_title = str(platform_meta.get("title") or platform_key or "")
         await notify_admin_new_manual_order(
             bot,

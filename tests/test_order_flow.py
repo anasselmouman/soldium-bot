@@ -202,6 +202,39 @@ def test_validate_tiktok_comment_link_type():
     assert ok2 is False
 
 
+def test_comment_semantics_from_link_type_not_service_id():
+    """Phase 9N: Provider/Legacy ID alone must not force comment-link rules."""
+    id_only = {"id": "4371"}
+    ok, _ = validate_platform_link(
+        "https://www.tiktok.com/@user/video/123",
+        "tiktok",
+        section_key="likes",
+        service=id_only,
+        service_id="4371",
+    )
+    assert ok is True
+    policy = {"link_type": "comment"}
+    ok2, _ = validate_platform_link(
+        "https://www.tiktok.com/@user/video/123",
+        "tiktok",
+        section_key="likes",
+        service=policy,
+    )
+    assert ok2 is False
+
+
+def test_no_runtime_4371_provider_id_branch_in_order_flow():
+    from pathlib import Path
+    import re
+
+    text = Path(__file__).resolve().parents[1].joinpath("utils/order_flow.py").read_text(
+        encoding="utf-8"
+    )
+    assert not re.search(
+        r"""str\(service_id[^)]*\)\s*==\s*["']4371["']|service_id\s*==\s*["']4371["']""",
+        text,
+    )
+
 def test_format_service_note_html_plain_and_markdown():
     assert "<b>تنبيه</b>" in format_service_note_html("**تنبيه**")
     html_note = "⚠️ <b>هام</b>"

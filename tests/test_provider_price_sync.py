@@ -199,6 +199,53 @@ def test_sync_active_only_scope(temp_db: Path) -> None:
     assert float(inactive_rate) == 1.0
 
 
+def test_sync_does_not_overwrite_account_from_cross_account_fallback(
+    temp_db: Path,
+) -> None:
+    """Preferred/structure account must survive when ID is only found elsewhere."""
+    with db.get_connection() as connection:
+        _insert_service(
+            connection,
+            catalog_id="ig-9001",
+            external_service_id="9001",
+            platform_key="instagram",
+            provider_price_usd=1.0,
+        )
+        connection.execute(
+            "UPDATE smm_services SET provider_api_account = ? WHERE catalog_id = ?",
+            ("instagram", "ig-9001"),
+        )
+        connection.commit()
+
+    # Only present under tiktok catalog — classic cross-account fallback case.
+    catalogs = {
+        "gozibra": {
+            "tiktok": {
+                9001: ProviderServiceEntry(
+                    service_id=9001,
+                    rate_usd=3.25,
+                    min_qty=10,
+                    max_qty=999,
+                    api_account="tiktok",
+                    provider_slug="gozibra",
+                )
+            }
+        }
+    }
+    result = sync_provider_prices_to_db(catalogs, db_path=temp_db)
+    assert result.updated == 1
+
+    with db.get_connection() as connection:
+        row = connection.execute(
+            "SELECT provider_price_usd, min_qty, max_qty, provider_api_account "
+            "FROM smm_services WHERE catalog_id = 'ig-9001'"
+        ).fetchone()
+    assert float(row["provider_price_usd"]) == 3.25
+    assert int(row["min_qty"]) == 10
+    assert int(row["max_qty"]) == 999
+    assert row["provider_api_account"] == "instagram"
+
+
 def test_same_external_id_different_providers(temp_db: Path) -> None:
     with db.get_connection() as connection:
         _insert_service(

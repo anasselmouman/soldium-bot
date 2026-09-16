@@ -428,6 +428,15 @@ def init_db() -> None:
             connection.execute(
                 "UPDATE orders SET status_changed_at = created_at WHERE status_changed_at IS NULL"
             )
+        # Phase 8G — Option A execution identity (nullable TEXT; never backfill).
+        if "catalog_id" not in order_columns:
+            connection.execute("ALTER TABLE orders ADD COLUMN catalog_id TEXT")
+        if "external_service_id_snapshot" not in order_columns:
+            connection.execute(
+                "ALTER TABLE orders ADD COLUMN external_service_id_snapshot TEXT"
+            )
+
+        _migrate_orders_active_link_guard(connection)
 
         connection.execute(
             """
@@ -915,6 +924,147 @@ def transfer_referral_balance_to_main(user_id: int, amount: float) -> bool:
         return True
 
 
+def _migrate_orders_active_link_guard(connection: sqlite3.Connection) -> dict[str, object]:
+    """Add ``normalized_link`` + partial unique index for active-link protection.
+
+    Existing duplicate active links are preserved: the oldest order (MIN id) keeps
+    ``normalized_link``; newer conflicting actives get ``normalized_link`` cleared
+    so the unique index can be created without deleting/altering financial rows.
+    App-level ``find_active_order_for_link`` still sees leftovers via stored ``link``.
+    """
+    import logging
+
+    from utils.active_link_guard import (
+        active_link_status_sql_predicate,
+        normalize_order_link,
+    )
+
+    log = logging.getLogger(__name__)
+    report: dict[str, object] = {
+        "column_added": False,
+        "backfilled": 0,
+        "conflict_groups": 0,
+        "conflict_orders_cleared": 0,
+        "index_created": False,
+        "conflicts": [],
+    }
+
+    order_columns = {
+        str(row["name"]) for row in connection.execute("PRAGMA table_info(orders)").fetchall()
+    }
+    if "normalized_link" not in order_columns:
+        connection.execute("ALTER TABLE orders ADD COLUMN normalized_link TEXT")
+        report["column_added"] = True
+
+    rows = connection.execute(
+        "SELECT id, link, status, normalized_link FROM orders"
+    ).fetchall()
+    backfilled = 0
+    for row in rows:
+        current = str(row["normalized_link"] or "").strip()
+        if current:
+            continue
+        key = normalize_order_link(row["link"])
+        if not key:
+            continue
+        connection.execute(
+            "UPDATE orders SET normalized_link = ? WHERE id = ?",
+            (key, int(row["id"])),
+        )
+        backfilled += 1
+    report["backfilled"] = backfilled
+
+    status_pred = active_link_status_sql_predicate("status")
+    conflict_rows = connection.execute(
+        f"""
+        SELECT normalized_link, GROUP_CONCAT(id) AS ids, COUNT(*) AS cnt
+        FROM orders
+        WHERE normalized_link IS NOT NULL
+          AND TRIM(normalized_link) != ''
+          AND {status_pred}
+        GROUP BY normalized_link
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+
+    conflicts: list[dict[str, object]] = []
+    cleared = 0
+    for group in conflict_rows:
+        key = str(group["normalized_link"])
+        ids = sorted(
+            int(part) for part in str(group["ids"] or "").split(",") if part.strip().isdigit()
+        )
+        if len(ids) < 2:
+            continue
+        keep_id = ids[0]
+        drop_ids = ids[1:]
+        conflicts.append(
+            {
+                "normalized_link": key,
+                "keep_order_id": keep_id,
+                "cleared_order_ids": drop_ids,
+            }
+        )
+        for oid in drop_ids:
+            connection.execute(
+                "UPDATE orders SET normalized_link = NULL WHERE id = ?",
+                (oid,),
+            )
+            cleared += 1
+            log.warning(
+                "active_link_guard migration: cleared normalized_link on duplicate "
+                "active order id=%s (kept id=%s key=%r)",
+                oid,
+                keep_id,
+                key,
+            )
+    report["conflict_groups"] = len(conflicts)
+    report["conflict_orders_cleared"] = cleared
+    report["conflicts"] = conflicts
+    if conflicts:
+        log.warning(
+            "active_link_guard migration: %s conflict group(s), cleared normalized_link "
+            "on %s newer duplicate active order(s); all order rows preserved",
+            len(conflicts),
+            cleared,
+        )
+
+    # Re-verify no active duplicate keys remain before creating the index.
+    leftover = connection.execute(
+        f"""
+        SELECT normalized_link, COUNT(*) AS cnt
+        FROM orders
+        WHERE normalized_link IS NOT NULL
+          AND TRIM(normalized_link) != ''
+          AND {status_pred}
+        GROUP BY normalized_link
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    if leftover:
+        details = ", ".join(
+            f"{r['normalized_link']!r}×{r['cnt']}" for r in leftover
+        )
+        raise RuntimeError(
+            "active_link_guard migration aborted: unresolved active-link conflicts "
+            f"remain ({details}). No unique index created; financial data untouched."
+        )
+
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_active_normalized_link
+        ON orders (normalized_link)
+        WHERE normalized_link IS NOT NULL
+          AND TRIM(normalized_link) != ''
+          AND LOWER(REPLACE(status, '_', ' ')) IN (
+              'pending', 'pending admin', 'submitted', 'in progress', 'processing'
+          )
+        """
+    )
+    report["index_created"] = True
+    return report
+
+
 def create_order_with_balance_hold(
     user_id: int,
     service_name: str,
@@ -928,8 +1078,28 @@ def create_order_with_balance_hold(
     initial_status: str = "pending",
     fulfillment_mode: str = "auto",
     provider_cost_dh: float = 0.0,
+    catalog_id: str | None = None,
+    external_service_id_snapshot: str | None = None,
 ) -> int | None:
+    """Create order and debit balance atomically.
+
+    Returns ``None`` when the user/balance is insufficient.
+    Raises ``ActiveLinkOccupiedError`` when the target link is already occupied
+    by an active order (no debit, no row).
+    """
+    from utils.active_link_guard import (
+        ActiveLinkOccupiedError,
+        find_active_order_for_link,
+        is_active_link_order_status,
+        normalize_order_link,
+    )
+
     amount_money = to_float(amount)
+    stored_link = str(link or "")
+    normalized = normalize_order_link(stored_link)
+    # Empty / blank targets must not enter the unique occupancy index.
+    normalized_for_db = normalized or None
+
     with get_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
         user_row = connection.execute(
@@ -944,6 +1114,16 @@ def create_order_with_balance_hold(
         if balance < amount_money:
             connection.rollback()
             return None
+
+        status = str(initial_status or "pending").strip() or "pending"
+        if normalized_for_db and is_active_link_order_status(status):
+            occupied = find_active_order_for_link(connection, stored_link)
+            if occupied is not None:
+                connection.rollback()
+                raise ActiveLinkOccupiedError(
+                    existing_order_id=int(occupied["id"]),
+                    normalized_link=normalized_for_db,
+                )
 
         balance_cursor = connection.execute(
             """
@@ -968,33 +1148,52 @@ def create_order_with_balance_hold(
                 slug = get_default_provider_slug()
             except Exception:
                 slug = "gozibra"
-        status = str(initial_status or "pending").strip() or "pending"
         mode = str(fulfillment_mode or "auto").strip().lower() or "auto"
         if mode not in {"auto", "admin"}:
             mode = "auto"
-        order_cursor = connection.execute(
-            """
-            INSERT INTO orders (
-                user_id, service_name, service_id, link, quantity, amount, total_price, status,
-                api_account, provider_slug, fulfillment_mode, provider_cost_dh
+        legacy_catalog_id = str(catalog_id or "").strip() or None
+        external_snap = str(external_service_id_snapshot or "").strip() or None
+        try:
+            order_cursor = connection.execute(
+                """
+                INSERT INTO orders (
+                    user_id, service_name, service_id, link, quantity, amount, total_price, status,
+                    api_account, provider_slug, fulfillment_mode, provider_cost_dh,
+                    catalog_id, external_service_id_snapshot, normalized_link
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    service_name,
+                    service_id,
+                    stored_link,
+                    quantity,
+                    amount_money,
+                    amount_money,
+                    status,
+                    account,
+                    slug,
+                    mode,
+                    round(to_float(provider_cost_dh), 6),
+                    legacy_catalog_id,
+                    external_snap,
+                    normalized_for_db,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                service_name,
-                service_id,
-                link,
-                quantity,
-                amount_money,
-                amount_money,
-                status,
-                account,
-                slug,
-                mode,
-                round(to_float(provider_cost_dh), 6),
-            ),
-        )
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            from utils.active_link_guard import is_active_link_unique_violation
+
+            if normalized_for_db and is_active_link_unique_violation(exc):
+                occupied = find_active_order_for_link(connection, stored_link)
+                raise ActiveLinkOccupiedError(
+                    existing_order_id=(
+                        int(occupied["id"]) if occupied is not None else None
+                    ),
+                    normalized_link=normalized_for_db,
+                ) from exc
+            raise
         connection.commit()
         return int(order_cursor.lastrowid)
 

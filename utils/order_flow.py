@@ -492,6 +492,7 @@ def _validate_section_link_rules(
     sk = str(section_key or "").strip()
     ssk = str(subsection_key or "").strip()
     svc = service or {}
+    _ = service_id  # API compatibility only — never Provider/Legacy ID for target semantics
 
     if platform_key == "telegram":
         link_mode = _telegram_link_mode(sk or None, ssk or None)
@@ -531,7 +532,7 @@ def _validate_section_link_rules(
                 "أرسل رابط البث المباشر الجاري. يجب أن يحتوي على <code>/i/broadcasts/</code> أو مسار بث صالح.",
             )
 
-    needs_comment_link = svc.get("link_type") == "comment" or str(service_id or "") == "4371"
+    needs_comment_link = _service_requires_comment_link(svc)
     if needs_comment_link:
         lowered = raw.lower()
         if "/comment" not in lowered and "comment_id" not in lowered:
@@ -542,6 +543,16 @@ def _validate_section_link_rules(
             )
 
     return True, ""
+
+
+def _service_requires_comment_link(service: dict | None) -> bool:
+    """Target semantics from authored link_type / target_link_type — never Provider IDs."""
+    if not isinstance(service, dict):
+        return False
+    for key in ("link_type", "target_link_type"):
+        if str(service.get(key) or "").strip().lower() == "comment":
+            return True
+    return False
 
 
 def validate_platform_link(

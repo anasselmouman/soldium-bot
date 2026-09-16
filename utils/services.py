@@ -1,18 +1,22 @@
-from services_config import SERVICES
+from storefront import navigation_tree
 from utils.money import to_decimal
 
 ServiceLocation = tuple[dict, str, str | None, str | None]
 
 
+def _services() -> dict:
+    return navigation_tree()
+
+
 def get_category_title(category_key: str) -> str:
-    category = SERVICES.get(category_key)
+    category = _services().get(category_key)
     if not category:
         return "غير معروف"
     return str(category["title"])
 
 
 def _iter_catalog_entries():
-    for platform_key, category in SERVICES.items():
+    for platform_key, category in _services().items():
         if "items" in category:
             for item in category["items"]:
                 yield item, platform_key, None, None

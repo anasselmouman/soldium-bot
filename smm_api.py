@@ -87,11 +87,20 @@ class SMMManager:
             return data
         raise ValueError("صيغة استجابة الخدمات غير متوقعة من API.")
 
-    async def add_order(self, service: int, link: str, quantity: int) -> dict:
+    async def add_order(self, service: int | str, link: str, quantity: int) -> dict:
+        from utils.order_execution_identity import (
+            InvalidProviderExternalServiceId,
+            encode_provider_external_service_id_for_wire,
+        )
+
+        try:
+            wire_service = encode_provider_external_service_id_for_wire(service)
+        except InvalidProviderExternalServiceId as exc:
+            raise ValueError(str(exc)) from exc
         payload = {
             "key": self.api_key,
             "action": "add",
-            "service": service,
+            "service": wire_service,
             "link": link,
             "quantity": quantity,
         }

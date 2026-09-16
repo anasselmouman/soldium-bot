@@ -112,3 +112,18 @@ SERVICE_USD_TO_DH_MULTIPLIER = float(
 MARKUP_TELEGRAM = 22
 MARKUP_X = 23
 MARKUP_X_VIEWS = 37
+
+# Phase 9Q — Telegram storefront backend. Default MUST remain legacy.
+# Do NOT set to catalog in production. Missing/invalid → legacy.
+STOREFRONT_BACKEND = (
+    os.environ.get("STOREFRONT_BACKEND", "legacy").strip().lower() or "legacy"
+)
+if STOREFRONT_BACKEND not in {"legacy", "catalog"}:
+    STOREFRONT_BACKEND = "legacy"
+
+# Controlled 43-service Catalog pilot kill switch. Default DISABLED.
+# Do NOT confuse with STOREFRONT_BACKEND=catalog (full Catalog-only).
+# Enable only after PILOT_READY artifact + explicit ops approval.
+STOREFRONT_CATALOG_PILOT = (
+    os.environ.get("STOREFRONT_CATALOG_PILOT", "disabled").strip().lower() or "disabled"
+)

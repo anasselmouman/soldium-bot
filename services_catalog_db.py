@@ -66,8 +66,10 @@ def _item_from_row(row: sqlite3.Row) -> dict[str, Any]:
     else:
         external_id_raw = str(row["service_id"]).strip()
     local_id = str(row["local_item_id"] or catalog_id)
+    # Phase 8G: keep opaque TEXT before any provider-wire conversion.
+    external_id_text = str(external_id_raw or "").strip()
     try:
-        provider_external_id = int(external_id_raw)
+        provider_external_id = int(external_id_text) if external_id_text.isdigit() else 0
     except (TypeError, ValueError):
         provider_external_id = 0
     item: dict[str, Any] = {
@@ -79,6 +81,7 @@ def _item_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "max": int(row["max_qty"] or 0),
         "provider_id": provider_external_id,
         "external_service_id": provider_external_id,
+        "external_service_id_text": external_id_text,
         "provider_rate_usd": float(row["provider_price_usd"] or 0),
     }
     if str(row["category"] or "") == "per_unit":
@@ -192,6 +195,7 @@ SERVICE_ITEM_META_KEYS: tuple[str, ...] = (
     "auto_quantity",
     "note",
     "link_prompt_key",
+    "link_type",
     "notice_key",
 )
 SECTION_META_KEYS: tuple[str, ...] = ("section_notice_key", "note")

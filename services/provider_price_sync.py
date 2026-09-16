@@ -264,6 +264,9 @@ def sync_provider_prices_to_db(
                 name_ar=str(row["name_ar"] or ""),
                 provider_account=str(row["provider_api_account"] or "") or None,
             )
+            # Prefer the structure/stored routing account. Cross-account fallback
+            # may still supply price/limits, but must never rewrite provider_api_account
+            # to whichever Gozibra account happened to contain the external ID.
             entry = _lookup_provider_entry(
                 external_id,
                 provider_slug,
@@ -273,6 +276,8 @@ def sync_provider_prices_to_db(
             if entry is None:
                 result.missing_in_api += 1
                 continue
+
+            account_to_persist = preferred_account
 
             old_rate = _safe_float(row["provider_price_usd"])
             old_min = _safe_int(row["min_qty"], default=1)
@@ -301,7 +306,7 @@ def sync_provider_prices_to_db(
                     entry.rate_usd,
                     entry.min_qty,
                     entry.max_qty,
-                    entry.api_account,
+                    account_to_persist,
                     now,
                     provider_slug,
                     str(external_id),
