@@ -16,15 +16,157 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_amount DOUBLE PRECISION NOT
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS referral_payout_done BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS referral_commission_amount DOUBLE PRECISION NOT NULL DEFAULT 0;
 """
+import logging
 import sqlite3
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import Iterator, TypedDict
 
 from config import MIN_REFERRAL_WITHDRAW_DH
 from utils.money import to_float
 from utils.order_status_ar import normalize_order_status_key
 
 DB_PATH = Path(__file__).with_name("users.db")
+# Align with dashboard database_connector / other bot readers that already wait on locks.
+CONNECT_TIMEOUT_SECONDS = 30.0
+BUSY_TIMEOUT_MS = 30_000
+logger = logging.getLogger(__name__)
+
+
+class DatabaseIntegrityError(RuntimeError):
+    """Raised when the SQLite database fails preflight integrity_check."""
+
+
+class DatabaseBackupError(RuntimeError):
+    """Raised when a consistent SQLite backup cannot be completed."""
+
+
+def preflight_db_integrity(*, db_path: Path | None = None) -> None:
+    """
+    Read-only SQLite health check that must run before migrations.
+
+    If the database file does not exist yet, returns without error so first-run
+    creation via ``init_db()`` remains unchanged. Never writes, repairs, or
+    deletes database files.
+    """
+    path = Path(db_path) if db_path is not None else Path(DB_PATH)
+    if not path.exists():
+        return
+
+    connection: sqlite3.Connection | None = None
+    try:
+        # mode=ro avoids creating journals/side files while checking.
+        uri = path.resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
+        row = connection.execute("PRAGMA integrity_check").fetchone()
+        result = str(row[0]) if row is not None else ""
+        if result != "ok":
+            logger.error(
+                "Database failed integrity_check; startup aborted for safety. "
+                "path=%s integrity_check=%s",
+                path,
+                result,
+            )
+            raise DatabaseIntegrityError(
+                f"SQLite database failed integrity_check ({result!r}); "
+                f"startup stopped for safety: {path}"
+            )
+    except DatabaseIntegrityError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        logger.error(
+            "Database failed integrity_check; startup aborted for safety. "
+            "path=%s error=%s",
+            path,
+            exc,
+        )
+        raise DatabaseIntegrityError(
+            f"SQLite database error during integrity_check; "
+            f"startup stopped for safety: {path}"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def backup_database(
+    *,
+    source_path: Path | None = None,
+    backup_path: Path | None = None,
+) -> Path:
+    """
+    Create a consistent SQLite backup using ``sqlite3.Connection.backup()``.
+
+    This is the supported online-backup API: committed pages from an active WAL
+    are included in the destination file, so ``*-wal`` / ``*-shm`` do not need
+    to be copied separately. Does not delete, replace, or mutate application
+    data in the source database, and does not run ``wal_checkpoint``.
+
+    Not called automatically by ``get_connection()``. May be invoked by ``init_db()``
+    when one-time migrations are pending on an existing database.
+
+    Returns the path of the written backup file.
+    """
+    source = Path(source_path) if source_path is not None else Path(DB_PATH)
+    if not source.exists():
+        raise DatabaseBackupError(f"Cannot backup missing SQLite database: {source}")
+
+    destination = (
+        Path(backup_path)
+        if backup_path is not None
+        else source.with_name(
+            f"{source.name}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+    )
+    if destination.exists():
+        raise DatabaseBackupError(
+            f"Backup destination already exists (refusing to overwrite): {destination}"
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    source_conn: sqlite3.Connection | None = None
+    dest_conn: sqlite3.Connection | None = None
+    try:
+        # Read-only source: include WAL contents via the SQLite pager without
+        # writing checkpoints or altering production rows.
+        source_uri = source.resolve().as_uri() + "?mode=ro"
+        source_conn = sqlite3.connect(source_uri, uri=True)
+        dest_conn = sqlite3.connect(destination)
+        source_conn.backup(dest_conn)
+    except DatabaseBackupError:
+        raise
+    except sqlite3.Error as exc:
+        logger.error(
+            "SQLite backup failed; production database was not replaced. "
+            "source=%s dest=%s error=%s",
+            source,
+            destination,
+            exc,
+        )
+        if dest_conn is not None:
+            try:
+                dest_conn.close()
+            except sqlite3.Error:
+                pass
+            dest_conn = None
+        if destination.exists():
+            try:
+                destination.unlink()
+            except OSError:
+                logger.warning("Could not remove incomplete backup file: %s", destination)
+        raise DatabaseBackupError(
+            f"SQLite backup failed for {source} -> {destination}: {exc}"
+        ) from exc
+    finally:
+        if dest_conn is not None:
+            dest_conn.close()
+        if source_conn is not None:
+            source_conn.close()
+
+    logger.info("SQLite backup created: %s -> %s", source, destination)
+    return destination
 
 
 class UserRecord(TypedDict):
@@ -132,10 +274,80 @@ def _order_row_to_record(row: sqlite3.Row) -> OrderRecord:
     }
 
 
-def get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
+@contextmanager
+def get_connection() -> Iterator[sqlite3.Connection]:
+    """
+    Open ``users.db`` with shared lock-tolerant settings.
+
+    Configures timeout + busy_timeout (aligned with the dashboard / other bot
+    readers) so concurrent access waits instead of failing immediately.
+
+    Does **not** set ``PRAGMA foreign_keys=ON`` yet: the schema declares FKs and
+    the dashboard enables them, but the bot historically ran with SQLite's
+    default (OFF). Turning enforcement on changes ``IntegrityError`` behavior
+    for child inserts and needs a dedicated insert-order audit.
+
+    Does **not** set ``journal_mode``: production WAL is already persisted in the
+    database file header; changing journal mode is a durable DB change and is
+    left to explicit maintenance, not every connection.
+
+    Used as ``with get_connection() as connection:``. Commits on success, rolls
+    back on error (same as sqlite3.Connection context-manager semantics), and
+    always closes the underlying connection.
+    """
+    connection = sqlite3.connect(str(DB_PATH), timeout=CONNECT_TIMEOUT_SECONDS)
     connection.row_factory = sqlite3.Row
-    return connection
+    connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def maintenance_wal_checkpoint(
+    *,
+    db_path: Path | None = None,
+    mode: str = "TRUNCATE",
+) -> tuple[int, int, int]:
+    """
+    Maintenance-only WAL checkpoint helper.
+
+    Not used by ``get_connection()``, ``init_db()``, or normal request paths.
+    Intended for controlled deployment/maintenance when a checkpoint is desired
+    after backups or before offline file operations.
+
+    ``mode`` must be one of: PASSIVE, FULL, RESTART, TRUNCATE.
+    Returns the ``(busy, log, checkpointed)`` triple from SQLite.
+    """
+    allowed = {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}
+    normalized = str(mode or "TRUNCATE").strip().upper()
+    if normalized not in allowed:
+        raise ValueError(f"Unsupported wal_checkpoint mode: {mode!r}")
+
+    path = Path(db_path) if db_path is not None else Path(DB_PATH)
+    if not path.exists():
+        raise FileNotFoundError(f"Cannot checkpoint missing SQLite database: {path}")
+
+    connection = sqlite3.connect(str(path), timeout=CONNECT_TIMEOUT_SECONDS)
+    try:
+        connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        row = connection.execute(f"PRAGMA wal_checkpoint({normalized})").fetchone()
+        if row is None:
+            raise sqlite3.OperationalError("wal_checkpoint returned no result")
+        result = (int(row[0]), int(row[1]), int(row[2]))
+        logger.info(
+            "maintenance_wal_checkpoint mode=%s path=%s result=%s",
+            normalized,
+            path,
+            result,
+        )
+        return result
+    finally:
+        connection.close()
 
 
 def _dedupe_active_deposit_proofs(connection: sqlite3.Connection) -> int:
@@ -186,17 +398,310 @@ def _migrate_provider_accounts_display_name(connection: sqlite3.Connection) -> N
     from services.provider_registry import default_display_name_for_account
 
     rows = connection.execute(
-        "SELECT id, account_key, display_name FROM provider_accounts"
+        """
+        SELECT id, account_key, display_name FROM provider_accounts
+        WHERE TRIM(COALESCE(display_name, '')) = ''
+        """
     ).fetchall()
     for row in rows:
-        current = str(row["display_name"] or "").strip()
-        if current:
-            continue
         label = default_display_name_for_account(str(row["account_key"]))
         connection.execute(
             "UPDATE provider_accounts SET display_name = ? WHERE id = ?",
             (label, int(row["id"])),
         )
+
+
+def _backfill_orders_amount_from_total_price(connection: sqlite3.Connection) -> int:
+    """One-time historical backfill: amount=0 rows copy total_price. No-op when none match."""
+    needs = connection.execute(
+        """
+        SELECT 1 FROM orders
+        WHERE amount = 0 AND COALESCE(total_price, 0) != 0
+        LIMIT 1
+        """
+    ).fetchone()
+    if needs is None:
+        return 0
+    cursor = connection.execute(
+        """
+        UPDATE orders
+        SET amount = total_price
+        WHERE amount = 0 AND COALESCE(total_price, 0) != 0
+        """
+    )
+    return int(cursor.rowcount or 0)
+
+
+def _backfill_smm_subscription_fulfillment_mode(connection: sqlite3.Connection) -> int:
+    """One-time backfill: subscriptions rows still on auto → admin. No-op when none match."""
+    needs = connection.execute(
+        """
+        SELECT 1 FROM smm_services
+        WHERE platform_key = 'subscriptions'
+          AND COALESCE(fulfillment_mode, 'auto') = 'auto'
+        LIMIT 1
+        """
+    ).fetchone()
+    if needs is None:
+        return 0
+    cursor = connection.execute(
+        """
+        UPDATE smm_services
+        SET fulfillment_mode = 'admin'
+        WHERE platform_key = 'subscriptions'
+          AND COALESCE(fulfillment_mode, 'auto') = 'auto'
+        """
+    )
+    return int(cursor.rowcount or 0)
+
+
+def _orders_active_link_index_exists(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'index' AND name = 'idx_orders_active_normalized_link'
+        """
+    ).fetchone()
+    return row is not None
+
+
+def _orders_active_link_has_conflicts(connection: sqlite3.Connection) -> bool:
+    from utils.active_link_guard import active_link_status_sql_predicate
+
+    status_pred = active_link_status_sql_predicate("status")
+    row = connection.execute(
+        f"""
+        SELECT 1
+        FROM orders
+        WHERE normalized_link IS NOT NULL
+          AND TRIM(normalized_link) != ''
+          AND {status_pred}
+        GROUP BY normalized_link
+        HAVING COUNT(*) > 1
+        LIMIT 1
+        """
+    ).fetchone()
+    return row is not None
+
+
+def _orders_active_link_migration_needed(connection: sqlite3.Connection) -> bool:
+    """True when column/index is missing or unresolved active-link conflicts remain."""
+    order_columns = {
+        str(row["name"]) for row in connection.execute("PRAGMA table_info(orders)").fetchall()
+    }
+    if "normalized_link" not in order_columns:
+        return True
+    if not _orders_active_link_index_exists(connection):
+        return True
+    return _orders_active_link_has_conflicts(connection)
+
+
+def pending_init_db_migrations(*, db_path: Path | None = None) -> list[str]:
+    """
+    Read-only list of one-time init_db migrations that are not yet applied.
+
+    Empty means no one-time migrations are pending. Harmless ``CREATE IF NOT EXISTS``
+    / ``INSERT OR IGNORE`` may still run during ``init_db()``. Not a version registry.
+    Does not create backups and is not called automatically by ``init_db()``.
+    """
+    path = Path(db_path) if db_path is not None else Path(DB_PATH)
+    if not path.exists():
+        return ["first_run_create_schema"]
+
+    pending: list[str] = []
+    uri = path.resolve().as_uri() + "?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "orders" not in tables:
+            pending.append("first_run_create_schema")
+            return pending
+
+        required_tables = (
+            "users",
+            "deposits",
+            "deposit_transactions",
+            "withdrawals",
+            "orders",
+            "refund_audit_log",
+            "pending_notifications",
+            "admin_alerts",
+            "admin_notifications",
+            "pending_referral_level_upgrades",
+            "smm_services",
+            "providers",
+            "provider_accounts",
+            "timed_announcements",
+            "timed_announcement_dismissals",
+            "scheduled_message_deletions",
+        )
+        for table_name in required_tables:
+            if table_name not in tables:
+                pending.append(f"create_table:{table_name}")
+
+        order_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(orders)").fetchall()
+        }
+        for col in (
+            "service_name",
+            "amount",
+            "start_count",
+            "refunded_amount",
+            "referral_payout_done",
+            "referral_commission_amount",
+            "status_note",
+            "api_account",
+            "fulfillment_mode",
+            "provider_cost_dh",
+            "status_changed_at",
+            "catalog_id",
+            "external_service_id_snapshot",
+            "normalized_link",
+            "provider_slug",
+        ):
+            if col not in order_columns:
+                pending.append(f"orders_add_column:{col}")
+
+        if _orders_active_link_migration_needed(connection):
+            pending.append("orders_active_link_guard")
+
+        user_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(users)").fetchall()
+        }
+        for col in (
+            "referred_by",
+            "partner_status",
+            "referral_level",
+            "referral_earned_total",
+            "referral_balance",
+            "telegram_name",
+            "living_ui_chat_id",
+            "living_ui_message_id",
+            "living_ui_has_photo",
+        ):
+            if col not in user_columns:
+                pending.append(f"users_add_column:{col}")
+
+        if "withdrawals" in tables:
+            withdrawal_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(withdrawals)").fetchall()
+            }
+            if "withdrawal_type" not in withdrawal_columns:
+                pending.append("withdrawals_add_column:withdrawal_type")
+
+        if "pending_referral_level_upgrades" in tables:
+            row = connection.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'pending_referral_level_upgrades'
+                """
+            ).fetchone()
+            ddl = str(row["sql"] or "") if row is not None else ""
+            if "AUTOINCREMENT" not in ddl.upper():
+                pending.append("pending_referral_level_upgrades_rebuild")
+
+        smm_has_catalog_id = False
+        if "smm_services" in tables:
+            smm_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(smm_services)").fetchall()
+            }
+            smm_has_catalog_id = "catalog_id" in smm_columns
+            for col in (
+                "fulfillment_mode",
+                "provider_api_account",
+                "provider_price_updated_at",
+                "provider_slug",
+                "catalog_id",
+            ):
+                if col not in smm_columns:
+                    pending.append(f"smm_services_add_or_rebuild:{col}")
+            if "fulfillment_mode" in smm_columns and "platform_key" in smm_columns:
+                if connection.execute(
+                    """
+                    SELECT 1 FROM smm_services
+                    WHERE platform_key = 'subscriptions'
+                      AND COALESCE(fulfillment_mode, 'auto') = 'auto'
+                    LIMIT 1
+                    """
+                ).fetchone():
+                    pending.append("smm_services_subscription_fulfillment_backfill")
+
+        if "timed_announcements" in tables:
+            timed_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(timed_announcements)"
+                ).fetchall()
+            }
+            if "auto_delete_seconds" not in timed_columns:
+                pending.append("timed_announcements_add_column:auto_delete_seconds")
+
+        if (
+            "amount" in order_columns
+            and "total_price" in order_columns
+            and connection.execute(
+                """
+                SELECT 1 FROM orders
+                WHERE amount = 0 AND COALESCE(total_price, 0) != 0
+                LIMIT 1
+                """
+            ).fetchone()
+        ):
+            pending.append("orders_amount_total_price_backfill")
+
+        if "provider_accounts" in tables:
+            pacols = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(provider_accounts)"
+                ).fetchall()
+            }
+            if "display_name" not in pacols:
+                pending.append("provider_accounts_add_column:display_name")
+            elif connection.execute(
+                """
+                SELECT 1 FROM provider_accounts
+                WHERE TRIM(COALESCE(display_name, '')) = ''
+                LIMIT 1
+                """
+            ).fetchone():
+                pending.append("provider_accounts_display_name_backfill")
+
+        if "deposits" in tables and connection.execute(
+            """
+            SELECT 1
+            FROM deposits
+            WHERE status = 'pending' OR status LIKE 'approved:%'
+            GROUP BY proof_file_id
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone():
+            pending.append("deposits_active_proof_dedupe")
+
+        index_names = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name IS NOT NULL"
+            ).fetchall()
+        }
+        if "deposits" in tables and "idx_deposits_active_proof_unique" not in index_names:
+            pending.append("create_index:idx_deposits_active_proof_unique")
+        if smm_has_catalog_id and "idx_smm_services_provider_external" not in index_names:
+            pending.append("create_index:idx_smm_services_provider_external")
+    finally:
+        connection.close()
+    return pending
 
 
 def _migrate_smm_services_catalog_identity(connection: sqlite3.Connection) -> None:
@@ -223,86 +728,162 @@ def _migrate_smm_services_catalog_identity(connection: sqlite3.Connection) -> No
             """
         )
 
-    connection.execute(
-        """
-        CREATE TABLE smm_services_v2 (
-            catalog_id TEXT PRIMARY KEY,
-            external_service_id TEXT NOT NULL,
-            provider_slug TEXT NOT NULL DEFAULT 'gozibra',
-            category TEXT NOT NULL DEFAULT '',
-            name_ar TEXT NOT NULL DEFAULT '',
-            provider_price_usd REAL NOT NULL DEFAULT 0,
-            local_price_dh REAL NOT NULL DEFAULT 0,
-            min_qty INTEGER NOT NULL DEFAULT 1,
-            max_qty INTEGER NOT NULL DEFAULT 1000000,
-            is_active INTEGER NOT NULL DEFAULT 1,
-            platform_key TEXT NOT NULL DEFAULT '',
-            section_key TEXT,
-            subsection_key TEXT,
-            local_item_id TEXT NOT NULL DEFAULT '',
-            platform_title TEXT NOT NULL DEFAULT '',
-            section_title TEXT,
-            subsection_title TEXT,
-            fulfillment_mode TEXT NOT NULL DEFAULT 'auto',
-            provider_api_account TEXT,
-            provider_price_updated_at TEXT,
-            service_id TEXT NOT NULL DEFAULT '',
-            UNIQUE(provider_slug, external_service_id)
+    # Persist mild ALTER/UPDATE work, then rebuild atomically so an interruption
+    # cannot leave smm_services dropped while smm_services_v2 still exists.
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE smm_services_v2 (
+                catalog_id TEXT PRIMARY KEY,
+                external_service_id TEXT NOT NULL,
+                provider_slug TEXT NOT NULL DEFAULT 'gozibra',
+                category TEXT NOT NULL DEFAULT '',
+                name_ar TEXT NOT NULL DEFAULT '',
+                provider_price_usd REAL NOT NULL DEFAULT 0,
+                local_price_dh REAL NOT NULL DEFAULT 0,
+                min_qty INTEGER NOT NULL DEFAULT 1,
+                max_qty INTEGER NOT NULL DEFAULT 1000000,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                platform_key TEXT NOT NULL DEFAULT '',
+                section_key TEXT,
+                subsection_key TEXT,
+                local_item_id TEXT NOT NULL DEFAULT '',
+                platform_title TEXT NOT NULL DEFAULT '',
+                section_title TEXT,
+                subsection_title TEXT,
+                fulfillment_mode TEXT NOT NULL DEFAULT 'auto',
+                provider_api_account TEXT,
+                provider_price_updated_at TEXT,
+                service_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(provider_slug, external_service_id)
+            )
+            """
         )
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO smm_services_v2 (
-            catalog_id, external_service_id, provider_slug, category, name_ar,
-            provider_price_usd, local_price_dh, min_qty, max_qty, is_active,
-            platform_key, section_key, subsection_key, local_item_id,
-            platform_title, section_title, subsection_title,
-            fulfillment_mode, provider_api_account, provider_price_updated_at, service_id
+        connection.execute(
+            """
+            INSERT INTO smm_services_v2 (
+                catalog_id, external_service_id, provider_slug, category, name_ar,
+                provider_price_usd, local_price_dh, min_qty, max_qty, is_active,
+                platform_key, section_key, subsection_key, local_item_id,
+                platform_title, section_title, subsection_title,
+                fulfillment_mode, provider_api_account, provider_price_updated_at, service_id
+            )
+            SELECT
+                COALESCE(NULLIF(TRIM(local_item_id), ''), service_id),
+                COALESCE(NULLIF(TRIM(external_service_id), ''), service_id),
+                COALESCE(NULLIF(TRIM(provider_slug), ''), 'gozibra'),
+                category, name_ar, provider_price_usd, local_price_dh,
+                min_qty, max_qty, is_active, platform_key, section_key, subsection_key,
+                COALESCE(NULLIF(TRIM(local_item_id), ''), service_id),
+                platform_title, section_title, subsection_title,
+                COALESCE(fulfillment_mode, 'auto'),
+                provider_api_account, provider_price_updated_at,
+                COALESCE(NULLIF(TRIM(external_service_id), ''), service_id)
+            FROM smm_services
+            """
         )
-        SELECT
-            COALESCE(NULLIF(TRIM(local_item_id), ''), service_id),
-            COALESCE(NULLIF(TRIM(external_service_id), ''), service_id),
-            COALESCE(NULLIF(TRIM(provider_slug), ''), 'gozibra'),
-            category, name_ar, provider_price_usd, local_price_dh,
-            min_qty, max_qty, is_active, platform_key, section_key, subsection_key,
-            COALESCE(NULLIF(TRIM(local_item_id), ''), service_id),
-            platform_title, section_title, subsection_title,
-            COALESCE(fulfillment_mode, 'auto'),
-            provider_api_account, provider_price_updated_at,
-            COALESCE(NULLIF(TRIM(external_service_id), ''), service_id)
-        FROM smm_services
-        """
-    )
-    connection.execute("DROP TABLE smm_services")
-    connection.execute("ALTER TABLE smm_services_v2 RENAME TO smm_services")
-    connection.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_smm_services_active
-        ON smm_services (is_active, platform_key)
-        """
-    )
-    connection.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_smm_services_fulfillment
-        ON smm_services (fulfillment_mode, platform_key)
-        """
-    )
-    connection.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_smm_services_provider
-        ON smm_services (provider_slug, is_active)
-        """
-    )
-    connection.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_smm_services_provider_external
-        ON smm_services (provider_slug, external_service_id)
-        """
-    )
+        connection.execute("DROP TABLE smm_services")
+        connection.execute("ALTER TABLE smm_services_v2 RENAME TO smm_services")
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_smm_services_active
+            ON smm_services (is_active, platform_key)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_smm_services_fulfillment
+            ON smm_services (fulfillment_mode, platform_key)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_smm_services_provider
+            ON smm_services (provider_slug, is_active)
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_smm_services_provider_external
+            ON smm_services (provider_slug, external_service_id)
+            """
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
 
 
 def init_db() -> None:
+    """
+    Initialize schema and apply pending one-time migrations.
+
+    Lifecycle for an existing DB:
+      integrity preflight → pending migration check → optional WAL-safe backup →
+      migrations → final integrity check (when migrations or first-run create ran).
+
+    Fresh installs (missing ``users.db``) skip backup and create the schema normally.
+
+    Cross-process migration coordination (Phase 12): the full critical section runs
+    under ``migration_lock`` so bot and dashboard never migrate concurrently.
+    """
+    from migration_lock import migration_lock
+
+    with migration_lock(db_path=DB_PATH, holder="soldium-bot"):
+        _init_db_under_migration_lock()
+
+
+def _init_db_under_migration_lock() -> None:
+    """Migration critical section — caller must hold ``migration_lock`` (or nest)."""
+    db_existed = Path(DB_PATH).exists()
+    # Fail closed on a corrupted existing DB before any migration/schema writes.
+    preflight_db_integrity()
+
+    pending: list[str] = []
+    backup_path: Path | None = None
+    if db_existed:
+        pending = pending_init_db_migrations()
+        if pending:
+            logger.info(
+                "Pending init_db migrations detected (%s); creating pre-migration backup.",
+                ", ".join(pending),
+            )
+            try:
+                backup_path = backup_database()
+            except DatabaseBackupError:
+                logger.error(
+                    "Pre-migration backup failed; init_db aborted before applying "
+                    "pending migrations: %s",
+                    ", ".join(pending),
+                )
+                raise
+            logger.info(
+                "Pre-migration backup ready at %s; applying pending migrations: %s",
+                backup_path,
+                ", ".join(pending),
+            )
+
+    try:
+        _apply_init_db_schema_and_migrations()
+    except Exception:
+        if backup_path is not None:
+            logger.error(
+                "init_db migration failed after successful backup; "
+                "backup preserved at %s (no automatic restore).",
+                backup_path,
+            )
+        raise
+
+    # Fresh create or real migrations may have written pages; re-verify.
+    # Skip when an existing healthy DB had no pending one-time migrations
+    # (preflight already validated; only IF NOT EXISTS / OR IGNORE ran).
+    if (not db_existed) or pending:
+        preflight_db_integrity()
+
+
+def _apply_init_db_schema_and_migrations() -> None:
     with get_connection() as connection:
         connection.execute(
             """
@@ -614,14 +1195,7 @@ def init_db() -> None:
             connection.execute(
                 "ALTER TABLE smm_services ADD COLUMN fulfillment_mode TEXT NOT NULL DEFAULT 'auto'"
             )
-        connection.execute(
-            """
-            UPDATE smm_services
-            SET fulfillment_mode = 'admin'
-            WHERE platform_key = 'subscriptions'
-              AND COALESCE(fulfillment_mode, 'auto') = 'auto'
-            """
-        )
+        _backfill_smm_subscription_fulfillment_mode(connection)
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_smm_services_fulfillment
@@ -673,16 +1247,7 @@ def init_db() -> None:
             """
         )
 
-        connection.execute(
-            """
-            UPDATE orders
-            SET
-                amount = CASE
-                    WHEN amount = 0 THEN total_price
-                    ELSE amount
-                END
-            """
-        )
+        _backfill_orders_amount_from_total_price(connection)
 
         connection.execute(
             """
@@ -931,6 +1496,9 @@ def _migrate_orders_active_link_guard(connection: sqlite3.Connection) -> dict[st
     ``normalized_link``; newer conflicting actives get ``normalized_link`` cleared
     so the unique index can be created without deleting/altering financial rows.
     App-level ``find_active_order_for_link`` still sees leftovers via stored ``link``.
+
+    Fully migrated databases (column + unique index present, no active conflicts)
+    are a no-op — the index is not dropped or recreated.
     """
     import logging
 
@@ -941,6 +1509,7 @@ def _migrate_orders_active_link_guard(connection: sqlite3.Connection) -> dict[st
 
     log = logging.getLogger(__name__)
     report: dict[str, object] = {
+        "skipped": False,
         "column_added": False,
         "backfilled": 0,
         "conflict_groups": 0,
@@ -949,119 +1518,136 @@ def _migrate_orders_active_link_guard(connection: sqlite3.Connection) -> dict[st
         "conflicts": [],
     }
 
-    order_columns = {
-        str(row["name"]) for row in connection.execute("PRAGMA table_info(orders)").fetchall()
-    }
-    if "normalized_link" not in order_columns:
-        connection.execute("ALTER TABLE orders ADD COLUMN normalized_link TEXT")
-        report["column_added"] = True
+    if not _orders_active_link_migration_needed(connection):
+        report["skipped"] = True
+        return report
 
-    rows = connection.execute(
-        "SELECT id, link, status, normalized_link FROM orders"
-    ).fetchall()
-    backfilled = 0
-    for row in rows:
-        current = str(row["normalized_link"] or "").strip()
-        if current:
-            continue
-        key = normalize_order_link(row["link"])
-        if not key:
-            continue
-        connection.execute(
-            "UPDATE orders SET normalized_link = ? WHERE id = ?",
-            (key, int(row["id"])),
-        )
-        backfilled += 1
-    report["backfilled"] = backfilled
+    # Keep DROP INDEX + backfill + conflict clears + CREATE INDEX atomic so a
+    # failed run does not leave the unique index permanently missing.
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        order_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(orders)").fetchall()
+        }
+        if "normalized_link" not in order_columns:
+            connection.execute("ALTER TABLE orders ADD COLUMN normalized_link TEXT")
+            report["column_added"] = True
 
-    status_pred = active_link_status_sql_predicate("status")
-    conflict_rows = connection.execute(
-        f"""
-        SELECT normalized_link, GROUP_CONCAT(id) AS ids, COUNT(*) AS cnt
-        FROM orders
-        WHERE normalized_link IS NOT NULL
-          AND TRIM(normalized_link) != ''
-          AND {status_pred}
-        GROUP BY normalized_link
-        HAVING COUNT(*) > 1
-        """
-    ).fetchall()
+        # Drop only while performing an incomplete migration: re-running backfill
+        # against an existing unique index can fail on leftover NULL duplicates.
+        connection.execute("DROP INDEX IF EXISTS idx_orders_active_normalized_link")
 
-    conflicts: list[dict[str, object]] = []
-    cleared = 0
-    for group in conflict_rows:
-        key = str(group["normalized_link"])
-        ids = sorted(
-            int(part) for part in str(group["ids"] or "").split(",") if part.strip().isdigit()
-        )
-        if len(ids) < 2:
-            continue
-        keep_id = ids[0]
-        drop_ids = ids[1:]
-        conflicts.append(
-            {
-                "normalized_link": key,
-                "keep_order_id": keep_id,
-                "cleared_order_ids": drop_ids,
-            }
-        )
-        for oid in drop_ids:
+        rows = connection.execute(
+            "SELECT id, link, status, normalized_link FROM orders"
+        ).fetchall()
+        backfilled = 0
+        for row in rows:
+            current = str(row["normalized_link"] or "").strip()
+            if current:
+                continue
+            key = normalize_order_link(row["link"])
+            if not key:
+                continue
             connection.execute(
-                "UPDATE orders SET normalized_link = NULL WHERE id = ?",
-                (oid,),
+                "UPDATE orders SET normalized_link = ? WHERE id = ?",
+                (key, int(row["id"])),
             )
-            cleared += 1
+            backfilled += 1
+        report["backfilled"] = backfilled
+
+        status_pred = active_link_status_sql_predicate("status")
+        conflict_rows = connection.execute(
+            f"""
+            SELECT normalized_link, GROUP_CONCAT(id) AS ids, COUNT(*) AS cnt
+            FROM orders
+            WHERE normalized_link IS NOT NULL
+              AND TRIM(normalized_link) != ''
+              AND {status_pred}
+            GROUP BY normalized_link
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+
+        conflicts: list[dict[str, object]] = []
+        cleared = 0
+        for group in conflict_rows:
+            key = str(group["normalized_link"])
+            ids = sorted(
+                int(part) for part in str(group["ids"] or "").split(",") if part.strip().isdigit()
+            )
+            if len(ids) < 2:
+                continue
+            keep_id = ids[0]
+            drop_ids = ids[1:]
+            conflicts.append(
+                {
+                    "normalized_link": key,
+                    "keep_order_id": keep_id,
+                    "cleared_order_ids": drop_ids,
+                }
+            )
+            for oid in drop_ids:
+                connection.execute(
+                    "UPDATE orders SET normalized_link = NULL WHERE id = ?",
+                    (oid,),
+                )
+                cleared += 1
+                log.warning(
+                    "active_link_guard migration: cleared normalized_link on duplicate "
+                    "active order id=%s (kept id=%s key=%r)",
+                    oid,
+                    keep_id,
+                    key,
+                )
+        report["conflict_groups"] = len(conflicts)
+        report["conflict_orders_cleared"] = cleared
+        report["conflicts"] = conflicts
+        if conflicts:
             log.warning(
-                "active_link_guard migration: cleared normalized_link on duplicate "
-                "active order id=%s (kept id=%s key=%r)",
-                oid,
-                keep_id,
-                key,
+                "active_link_guard migration: %s conflict group(s), cleared normalized_link "
+                "on %s newer duplicate active order(s); all order rows preserved",
+                len(conflicts),
+                cleared,
             )
-    report["conflict_groups"] = len(conflicts)
-    report["conflict_orders_cleared"] = cleared
-    report["conflicts"] = conflicts
-    if conflicts:
-        log.warning(
-            "active_link_guard migration: %s conflict group(s), cleared normalized_link "
-            "on %s newer duplicate active order(s); all order rows preserved",
-            len(conflicts),
-            cleared,
-        )
 
-    # Re-verify no active duplicate keys remain before creating the index.
-    leftover = connection.execute(
-        f"""
-        SELECT normalized_link, COUNT(*) AS cnt
-        FROM orders
-        WHERE normalized_link IS NOT NULL
-          AND TRIM(normalized_link) != ''
-          AND {status_pred}
-        GROUP BY normalized_link
-        HAVING COUNT(*) > 1
-        """
-    ).fetchall()
-    if leftover:
-        details = ", ".join(
-            f"{r['normalized_link']!r}×{r['cnt']}" for r in leftover
-        )
-        raise RuntimeError(
-            "active_link_guard migration aborted: unresolved active-link conflicts "
-            f"remain ({details}). No unique index created; financial data untouched."
-        )
+        # Re-verify no active duplicate keys remain before creating the index.
+        leftover = connection.execute(
+            f"""
+            SELECT normalized_link, COUNT(*) AS cnt
+            FROM orders
+            WHERE normalized_link IS NOT NULL
+              AND TRIM(normalized_link) != ''
+              AND {status_pred}
+            GROUP BY normalized_link
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        if leftover:
+            details = ", ".join(
+                f"{r['normalized_link']!r}×{r['cnt']}" for r in leftover
+            )
+            raise RuntimeError(
+                "active_link_guard migration aborted: unresolved active-link conflicts "
+                f"remain ({details}). No unique index created; financial data untouched."
+            )
 
-    connection.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_active_normalized_link
-        ON orders (normalized_link)
-        WHERE normalized_link IS NOT NULL
-          AND TRIM(normalized_link) != ''
-          AND LOWER(REPLACE(status, '_', ' ')) IN (
-              'pending', 'pending admin', 'submitted', 'in progress', 'processing'
-          )
-        """
-    )
-    report["index_created"] = True
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_active_normalized_link
+            ON orders (normalized_link)
+            WHERE normalized_link IS NOT NULL
+              AND TRIM(normalized_link) != ''
+              AND LOWER(REPLACE(status, '_', ' ')) IN (
+                  'pending', 'pending admin', 'submitted', 'in progress', 'processing'
+              )
+            """
+        )
+        report["index_created"] = True
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     return report
 
 
@@ -1217,28 +1803,36 @@ def _migrate_pending_referral_level_upgrades_table(connection: sqlite3.Connectio
     ddl = str(row["sql"] or "")
     if "AUTOINCREMENT" in ddl.upper():
         return
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pending_referral_level_upgrades_new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            new_level INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, new_level)
+    # Atomic rebuild: avoid leaving *_new without the live table name.
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_referral_level_upgrades_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                new_level INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, new_level)
+            )
+            """
         )
-        """
-    )
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO pending_referral_level_upgrades_new (user_id, new_level, created_at)
-        SELECT user_id, new_level, created_at FROM pending_referral_level_upgrades
-        """
-    )
-    connection.execute("DROP TABLE pending_referral_level_upgrades")
-    connection.execute(
-        "ALTER TABLE pending_referral_level_upgrades_new "
-        "RENAME TO pending_referral_level_upgrades"
-    )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO pending_referral_level_upgrades_new (user_id, new_level, created_at)
+            SELECT user_id, new_level, created_at FROM pending_referral_level_upgrades
+            """
+        )
+        connection.execute("DROP TABLE pending_referral_level_upgrades")
+        connection.execute(
+            "ALTER TABLE pending_referral_level_upgrades_new "
+            "RENAME TO pending_referral_level_upgrades"
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
 
 
 def count_active_referred_users(referrer_id: int, *, connection: sqlite3.Connection | None = None) -> int:

@@ -66,8 +66,9 @@ def _db_path() -> Path:
 
 def _open_catalog_connection() -> sqlite3.Connection:
     path = _db_path()
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 
