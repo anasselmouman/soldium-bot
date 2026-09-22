@@ -83,7 +83,7 @@ CRYPTO_DEPOSIT_WEBHOOK_URL = os.environ.get("CRYPTO_DEPOSIT_WEBHOOK_URL", "").st
 # نسبة رصيد بطاقات التعبئة (70% للعميل)
 RECHARGE_CREDIT_RATIO = 0.70
 
-# حدود الشحن عند اعتماد الأدمن (بالدرهم المغربي)
+# حدود إرشادية للشحن في واجهة المستخدم (لا تُفرَض على مبلغ اعتماد الأدمن)
 MIN_DEPOSIT_DH = 5.0
 MAX_SINGLE_DEPOSIT_DH = float(os.environ.get("MAX_SINGLE_DEPOSIT_DH", "50000"))
 
@@ -113,13 +113,13 @@ MARKUP_TELEGRAM = 22
 MARKUP_X = 23
 MARKUP_X_VIEWS = 37
 
-# Phase 9Q — Telegram storefront backend. Default MUST remain legacy.
-# Do NOT set to catalog in production. Missing/invalid → legacy.
+# Phase 9Q — Telegram storefront backend. Default is Catalog (customer SoT).
+# Set STOREFRONT_BACKEND=legacy only for emergency rollback.
 STOREFRONT_BACKEND = (
-    os.environ.get("STOREFRONT_BACKEND", "legacy").strip().lower() or "legacy"
+    os.environ.get("STOREFRONT_BACKEND", "catalog").strip().lower() or "catalog"
 )
 if STOREFRONT_BACKEND not in {"legacy", "catalog"}:
-    STOREFRONT_BACKEND = "legacy"
+    STOREFRONT_BACKEND = "catalog"
 
 # Controlled 43-service Catalog pilot kill switch. Default DISABLED.
 # Do NOT confuse with STOREFRONT_BACKEND=catalog (full Catalog-only).

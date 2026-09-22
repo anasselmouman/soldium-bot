@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Telegram Storefront facade — Phase 9Q + controlled Catalog pilot.
+"""Telegram Storefront facade — Phase 9Q + Catalog SoT.
 
 Handlers/keyboards must use ``get_storefront()`` rather than selecting
-backends themselves. Default remains Legacy.
+backends themselves. Default backend is Catalog (customer SoT).
 
 Pilot (STOREFRONT_CATALOG_PILOT=enabled) scopes Catalog to the published
 cohort only; STOREFRONT_BACKEND must stay legacy for that mode.
@@ -73,7 +73,7 @@ def _open_catalog_connection() -> sqlite3.Connection:
 
 
 def get_storefront(*, force_reload: bool = False) -> StorefrontBackend:
-    """Central storefront accessor for Telegram. Default backend: legacy."""
+    """Central storefront accessor for Telegram. Default backend: catalog."""
     global _cached
     if _cached is not None and not force_reload:
         return _cached

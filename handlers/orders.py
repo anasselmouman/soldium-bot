@@ -12,9 +12,30 @@ from database import (
     add_user,
     assign_provider_order_id,
     create_order_with_balance_hold,
+    create_order_with_balance_hold_consuming_funding_intent,
+    delete_pending_order_funding,
+    delete_pending_order_funding_by_intent,
+    get_pending_order_funding,
+    get_pending_order_funding_by_intent,
     get_user,
     refund_order,
     set_provider_order_id,
+    upsert_pending_order_funding,
+)
+# Bind bot ``services`` before storefront/catalog_core mutates sys.path.
+from services.order_admin_notify import notify_admin_new_manual_order
+from services.order_funding import (
+    ORDER_FUND_CONTEXT_KEY,
+    PENDING_FUNDING_INTENT_ID_KEY,
+    build_order_funding_screen_html,
+    build_pending_invalidated_html,
+    intent_price_matches_live,
+    resolve_live_total_for_intent,
+)
+from services.provider_catalog import get_provider_limits, refresh_all_provider_catalogs
+from services.smm_api_router import (
+    get_provider_credentials_for_service,
+    smm_manager_for_account,
 )
 from utils.active_link_guard import (
     ACTIVE_LINK_OCCUPIED_MESSAGE,
@@ -29,6 +50,8 @@ from keyboards.orders import (
     build_services_menu,
     build_order_confirm_keyboard,
     build_order_insufficient_balance_keyboard,
+    build_order_funding_methods_keyboard,
+    build_order_funding_pending_short_keyboard,
     build_order_active_link_occupied_keyboard,
     build_order_success_nav_keyboard,
     build_platforms_menu,
@@ -60,7 +83,6 @@ from utils.flow_transcript import (
     track_transcript_message,
     track_transcript_user_message,
 )
-from services.order_admin_notify import notify_admin_new_manual_order
 from utils.fulfillment import FULFILLMENT_ADMIN, service_requires_admin
 from utils.order_flow import (
     build_invoice_text,
@@ -97,11 +119,6 @@ from utils.telegram_ui import (
     ORDER_UI_DISMISS,
     allow_new_message_fallback,
     safe_edit_message_text,
-)
-from services.provider_catalog import get_provider_limits, refresh_all_provider_catalogs
-from services.smm_api_router import (
-    get_provider_credentials_for_service,
-    smm_manager_for_account,
 )
 from utils.notices import resolve_link_prompt, resolve_section_notice
 
@@ -691,6 +708,378 @@ async def _finish_order_flow(
     await state.clear()
 
 
+async def _show_order_funding_screen(
+    bot: Bot,
+    state: FSMContext,
+    user_id: int,
+    *,
+    order_total: float,
+    balance: float,
+    service_name: str,
+    message: Message | None = None,
+) -> None:
+    text = build_order_funding_screen_html(
+        order_total=order_total,
+        balance=balance,
+        service_name=service_name,
+    )
+    markup = build_order_funding_methods_keyboard()
+    await state.set_state(OrderFlow.confirm_order)
+    await state.update_data(**{ORDER_FUND_CONTEXT_KEY: True})
+    if message is not None:
+        await _edit_order_screen(
+            bot, state, user_id, text, markup, message=message
+        )
+    else:
+        await _edit_order_living_ui(bot, state, user_id, text, markup)
+    await _sync_living_nav_anchor(bot, state, user_id, markup)
+
+
+async def _gate_balance_then_confirm_or_fund(
+    bot: Bot,
+    state: FSMContext,
+    user_id: int,
+    chat_id: int,
+    *,
+    service: dict,
+    platform_key: str,
+    section_key: str | None,
+    subsection_key: str | None,
+    link: str,
+    quantity: int,
+    total_price,
+    auto_quantity: bool,
+    message: Message | None = None,
+    ack_reply_to_message_id: int | None = None,
+) -> None:
+    """After order details: confirm if funded, else persist intent + funding UI."""
+    total_f = to_float(total_price)
+    balance = _user_balance_amount(user_id)
+    await state.update_data(
+        confirm_quantity=quantity,
+        confirm_total=total_price,
+        link=link,
+        service_id=str(service["id"]),
+        platform_key=platform_key,
+        section_key=section_key or "",
+        subsection_key=subsection_key or "",
+    )
+
+    if balance >= total_f:
+        # Drop any durable pending funding row so confirm cannot leave an orphan.
+        data = await state.get_data()
+        raw_intent = data.get(PENDING_FUNDING_INTENT_ID_KEY)
+        if raw_intent is not None:
+            try:
+                delete_pending_order_funding_by_intent(int(raw_intent), user_id)
+            except (TypeError, ValueError):
+                delete_pending_order_funding(user_id)
+        else:
+            delete_pending_order_funding(user_id)
+        await state.update_data(**{PENDING_FUNDING_INTENT_ID_KEY: None})
+        await state.set_state(OrderFlow.confirm_order)
+        confirm_bc = await _order_breadcrumb_from_state(
+            state,
+            user_id=user_id,
+            service_name=str(service["name"]),
+            step_label="تأكيد الطلب",
+        )
+        invoice_text = build_invoice_text(
+            service,
+            CURRENCY_DISPLAY,
+            quantity,
+            total_price,
+            link,
+            is_fixed_quantity=auto_quantity,
+            breadcrumb_line=confirm_bc,
+        )
+        confirm_kb = build_order_confirm_keyboard()
+        await delete_flow_step_prompt(bot, state, chat_id)
+        if message is not None:
+            await _edit_order_living_ui(
+                bot, state, user_id, invoice_text, confirm_kb
+            )
+        else:
+            await _edit_order_living_ui(
+                bot, state, user_id, invoice_text, confirm_kb
+            )
+        if ack_reply_to_message_id is not None:
+            await acknowledge_then_focus_living_ui(
+                bot,
+                state,
+                user_id,
+                chat_id,
+                ack_text="✅ تم حفظ معلومات الطلب — راجع التفاصيل في الرسالة أعلاه واضغط تأكيد",
+                reply_to_message_id=ack_reply_to_message_id,
+            )
+        await _sync_living_nav_anchor(bot, state, user_id, confirm_kb)
+        return
+
+    intent_id = upsert_pending_order_funding(
+        user_id,
+        service_id=str(service["id"]),
+        service_name=str(service["name"]),
+        platform_key=platform_key,
+        section_key=section_key,
+        subsection_key=subsection_key,
+        link=link,
+        quantity=quantity,
+        amount_dh=total_f,
+        auto_quantity=auto_quantity,
+    )
+    await state.update_data(**{PENDING_FUNDING_INTENT_ID_KEY: intent_id})
+    await delete_flow_step_prompt(bot, state, chat_id)
+    await _show_order_funding_screen(
+        bot,
+        state,
+        user_id,
+        order_total=total_f,
+        balance=balance,
+        service_name=str(service["name"]),
+        message=message,
+    )
+    if ack_reply_to_message_id is not None:
+        await acknowledge_then_focus_living_ui(
+            bot,
+            state,
+            user_id,
+            chat_id,
+            ack_text="💳 رصيدك غير كافٍ — اختر وسيلة الدفع لتمويل هذا الطلب",
+            reply_to_message_id=ack_reply_to_message_id,
+        )
+
+
+async def restore_confirm_from_funding_intent(
+    bot: Bot,
+    user_id: int,
+    intent_id: int,
+    *,
+    storage=None,
+) -> bool:
+    """Rebuild confirmation UI from durable intent. Returns False if aborted."""
+    from aiogram.fsm.context import FSMContext as _FSMContext
+    from aiogram.fsm.storage.base import StorageKey
+    from utils.living_ui import edit_living_ui_message, get_user_living_ui
+    from utils.smart_notifications import send_smart_notification
+
+    intent = get_pending_order_funding_by_intent(intent_id, user_id)
+    if intent is None:
+        return False
+
+    located = find_service_location(str(intent["service_id"]))
+    if located is None:
+        delete_pending_order_funding_by_intent(intent_id, user_id)
+        await send_smart_notification(bot, user_id, build_pending_invalidated_html())
+        return False
+
+    service, _plat, _sec, _sub = located
+    if get_pending_order_funding_by_intent(intent_id, user_id) is None:
+        return False
+
+    platform_key = str(intent["platform_key"] or "")
+    section_key = intent.get("section_key") or None
+    subsection_key = intent.get("subsection_key") or None
+    qty = int(intent["quantity"])
+    auto_qty = bool(int(intent.get("auto_quantity") or 0))
+    if auto_qty and service.get("auto_quantity") is not None:
+        qty = int(service["auto_quantity"])
+    link = str(intent["link"])
+
+    is_valid_link, _link_error = _validate_order_link(
+        link, platform_key, section_key, subsection_key, service
+    )
+    if not is_valid_link:
+        delete_pending_order_funding_by_intent(intent_id, user_id)
+        await send_smart_notification(bot, user_id, build_pending_invalidated_html())
+        return False
+
+    if not auto_qty:
+        mn, mx = await _effective_limits(service)
+        if qty < mn or qty > mx:
+            delete_pending_order_funding_by_intent(intent_id, user_id)
+            await send_smart_notification(bot, user_id, build_pending_invalidated_html())
+            return False
+    else:
+        requires_admin = service_requires_admin(service)
+        if not requires_admin:
+            qty_ok, _qty_error = await _auto_quantity_provider_check(service)
+            if not qty_ok:
+                delete_pending_order_funding_by_intent(intent_id, user_id)
+                await send_smart_notification(bot, user_id, build_pending_invalidated_html())
+                return False
+
+    # Same Catalog / Legacy contract branch as order_confirm_yes.
+    storefront = get_storefront()
+    use_catalog_contract = storefront.backend_name == "catalog" or (
+        hasattr(storefront, "uses_catalog_order_contract")
+        and storefront.uses_catalog_order_contract(str(service["id"]))
+    )
+    live_total = None
+    if use_catalog_contract:
+        from catalog_core.storefront_adapter import StorefrontAdapterError
+        from storefront import order_intent_to_create_bridge
+
+        try:
+            catalog_intent = storefront.resolve_order_intent(
+                str(service["id"]), qty, target=link
+            )
+            conn = getattr(storefront, "_connection", None)
+            bridge = order_intent_to_create_bridge(
+                catalog_intent, user_id=user_id, connection=conn
+            )
+            live_total = to_decimal(bridge.amount_dh)
+            if not str(bridge.external_service_id_snapshot or "").strip():
+                delete_pending_order_funding_by_intent(intent_id, user_id)
+                await send_smart_notification(
+                    bot, user_id, build_pending_invalidated_html()
+                )
+                return False
+        except StorefrontAdapterError:
+            delete_pending_order_funding_by_intent(intent_id, user_id)
+            await send_smart_notification(bot, user_id, build_pending_invalidated_html())
+            return False
+    else:
+        live_total = order_total_price_dh(service, qty)
+        try:
+            service_category = " ".join(
+                _trail_from_order_context(platform_key, section_key, subsection_key)
+            )
+            get_provider_credentials_for_service(service, service_category)
+        except RuntimeError:
+            delete_pending_order_funding_by_intent(intent_id, user_id)
+            await send_smart_notification(bot, user_id, build_pending_invalidated_html())
+            return False
+
+        external_snap = str(service.get("external_service_id_text") or "").strip()
+        if not external_snap:
+            raw_ext = service.get("external_service_id")
+            if raw_ext is not None and str(raw_ext).strip() and str(raw_ext).strip() != "0":
+                external_snap = str(raw_ext).strip()
+        if not external_snap:
+            delete_pending_order_funding_by_intent(intent_id, user_id)
+            await send_smart_notification(bot, user_id, build_pending_invalidated_html())
+            return False
+
+    if not intent_price_matches_live(intent, live_total):
+        delete_pending_order_funding_by_intent(intent_id, user_id)
+        await send_smart_notification(bot, user_id, build_pending_invalidated_html())
+        return False
+
+    if get_pending_order_funding_by_intent(intent_id, user_id) is None:
+        return False
+
+    balance = _user_balance_amount(user_id)
+    live_f = to_float(live_total)
+    if balance < live_f:
+        return False
+
+    confirm_bc = _order_flow_header(
+        user_id,
+        *_trail_from_order_context(
+            platform_key,
+            section_key,
+            subsection_key,
+            service_name=str(service["name"]),
+            step_label="تأكيد الطلب",
+        ),
+    )
+    invoice_text = build_invoice_text(
+        service,
+        CURRENCY_DISPLAY,
+        qty,
+        live_total,
+        link,
+        is_fixed_quantity=auto_qty,
+        breadcrumb_line=confirm_bc,
+    )
+    confirm_kb = build_order_confirm_keyboard()
+
+    if get_pending_order_funding_by_intent(intent_id, user_id) is None:
+        return False
+
+    if storage is not None:
+        key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+        user_state = _FSMContext(storage=storage, key=key)
+        await user_state.set_state(OrderFlow.confirm_order)
+        await user_state.update_data(
+            **{
+                PENDING_FUNDING_INTENT_ID_KEY: intent_id,
+                ORDER_FUND_CONTEXT_KEY: False,
+                "service_id": str(service["id"]),
+                "link": link,
+                "confirm_quantity": qty,
+                "confirm_total": live_total,
+                "platform_key": platform_key,
+                "section_key": section_key or "",
+                "subsection_key": subsection_key or "",
+            }
+        )
+
+    lc, lm, hp = get_user_living_ui(user_id)
+    if lc is not None and lm is not None:
+        try:
+            await edit_living_ui_message(
+                bot, lc, lm, invoice_text, confirm_kb, has_photo=hp
+            )
+        except Exception:
+            await bot.send_message(
+                chat_id=user_id,
+                text=invoice_text,
+                reply_markup=confirm_kb,
+                parse_mode="HTML",
+            )
+    else:
+        await bot.send_message(
+            chat_id=user_id,
+            text=invoice_text,
+            reply_markup=confirm_kb,
+            parse_mode="HTML",
+        )
+
+    await send_smart_notification(
+        bot,
+        user_id,
+        (
+            "<b>رصيدك كافٍ الآن</b>\n"
+            "راجع تفاصيل الطلب واضغط <b>تأكيد الطلب</b> للمتابعة.\n"
+            "<i>لن يُنفَّذ الطلب إلا بعد تأكيدك.</i>"
+        ),
+    )
+    return True
+
+
+async def _try_recover_funded_pending_on_order_start(
+    bot: Bot,
+    state: FSMContext,
+    user_id: int,
+) -> bool:
+    """If durable pending exists and balance covers snapshot, restore confirm. Else False."""
+    intent = get_pending_order_funding(user_id)
+    if intent is None:
+        return False
+    intent_id = int(intent["intent_id"])
+    balance = _user_balance_amount(user_id)
+    # Snapshot floor only — authoritative Catalog/Legacy price is validated in restore.
+    if balance < to_float(intent["amount_dh"]):
+        return False
+
+    qty = int(intent["quantity"])
+    await state.set_state(OrderFlow.confirm_order)
+    await state.update_data(
+        **{
+            PENDING_FUNDING_INTENT_ID_KEY: intent_id,
+            "service_id": str(intent["service_id"]),
+            "link": intent["link"],
+            "confirm_quantity": qty,
+            "confirm_total": intent["amount_dh"],
+            "platform_key": intent["platform_key"],
+            "section_key": intent.get("section_key") or "",
+            "subsection_key": intent.get("subsection_key") or "",
+        }
+    )
+    return await restore_confirm_from_funding_intent(bot, user_id, intent_id)
+
+
 async def _clear_awaiting_prompt(
     callback: CallbackQuery, state: FSMContext, bot: Bot | None = None
 ) -> None:
@@ -1050,7 +1439,8 @@ async def _show_subsections(
     category = _services().get(platform_key, {})
     sections = category.get("sections") or {}
     section = sections.get(section_key) or {}
-    if not section.get("subsections"):
+    nested = section.get("subsections") or section.get("sections") or {}
+    if not nested:
         await _show_services(
             state,
             platform_key,
@@ -1061,6 +1451,9 @@ async def _show_subsections(
             use_edit=use_edit,
         )
         return
+    # Normalize Catalog nested sections into subsections for preview helpers
+    if not section.get("subsections") and section.get("sections"):
+        section = {**section, "subsections": section.get("sections")}
     await state.set_state(OrderFlow.choose_subcategory)
     await state.update_data(
         platform_key=platform_key,
@@ -1182,10 +1575,16 @@ async def order_start_callback(callback: CallbackQuery, state: FSMContext, bot: 
     await reset_flow_transcript(state)
     add_user(callback.from_user.id)
     await register_living_ui_message(state, callback.message, user_id=callback.from_user.id)
+    user_id = callback.from_user.id
+    # Recovery: funded pending → confirmation. Otherwise discard pending and start fresh.
+    if await _try_recover_funded_pending_on_order_start(bot, state, user_id):
+        await callback.answer()
+        return
+    delete_pending_order_funding(user_id)
     await _show_platforms(
         state,
         bot=bot,
-        user_id=callback.from_user.id,
+        user_id=user_id,
         message=callback.message,
         use_edit=True,
     )
@@ -1244,13 +1643,15 @@ async def order_choose_section_callback(
         await callback.answer("تصنيف غير صالح", show_alert=True)
         return
     _, _, platform_key, section_key = parts
-    sections = (_services().get(platform_key, {}) or {}).get("sections") or {}
+    platform_bucket = _services().get(platform_key, {}) or {}
+    sections = platform_bucket.get("sections") or {}
     if section_key not in sections:
         await callback.answer("تصنيف غير صالح", show_alert=True)
         return
 
     section = sections[section_key]
-    if section.get("subsections"):
+    nested = section.get("subsections") or section.get("sections") or {}
+    if nested:
         await _show_subsections(
             state,
             platform_key,
@@ -1270,6 +1671,41 @@ async def order_choose_section_callback(
             message=callback.message,
             use_edit=True,
         )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("order:node:"))
+async def order_choose_catalog_node(
+    callback: CallbackQuery, state: FSMContext, bot: Bot
+) -> None:
+    """Arbitrary-depth Catalog entries navigation."""
+    if not callback.from_user or not callback.message:
+        return
+    user_id = await _prepare_order_nav(callback, state, bot, purge_transcript=True)
+    if user_id is None:
+        return
+    entry_id = callback.data.split(":", maxsplit=2)[-1]
+    from keyboards.orders import build_catalog_node_menu, _find_catalog_node
+
+    node = _find_catalog_node(entry_id)
+    if not node:
+        await callback.answer("قسم غير صالح", show_alert=True)
+        return
+    await state.set_state(OrderFlow.choose_subcategory)
+    await state.update_data(nav_entry_id=entry_id)
+    title = str(node.get("title") or "الخدمات")
+    short_body = f"<b>{title}</b>\n\nاختر:"
+    parent = str((await state.get_data()).get("platform_key") or "")
+    back_cb = f"order:platform:{parent}" if parent else "order:nav:platforms"
+    markup = build_catalog_node_menu(entry_id, back_callback=back_cb)
+    has_photo = await _living_has_photo(state, user_id)
+    text = _order_caption_text(
+        short_body, short_body, has_photo=has_photo, user_id=user_id
+    )
+    if await _edit_order_screen(
+        bot, state, user_id, text, markup, message=callback.message
+    ):
+        await _sync_living_nav_anchor(bot, state, user_id, markup)
     await callback.answer()
 
 
@@ -1294,7 +1730,7 @@ async def order_choose_subsection_callback(
         return
     platform_key, section_key, subsection_key = parsed
     section = ((_services().get(platform_key, {}) or {}).get("sections") or {}).get(section_key) or {}
-    subsections = section.get("subsections") or {}
+    subsections = section.get("subsections") or section.get("sections") or {}
     if subsection_key not in subsections:
         await callback.answer("تصنيف فرعي غير صالح", show_alert=True)
         return
@@ -1314,6 +1750,34 @@ async def order_choose_subsection_callback(
             message=callback.message,
             use_edit=True,
         )
+        await callback.answer()
+        return
+    # Deeper Catalog nesting under this node → order:node menu
+    nested_bucket = subsections[subsection_key]
+    deeper = nested_bucket.get("sections") or {}
+    if deeper and not (nested_bucket.get("items") or []):
+        from keyboards.orders import build_catalog_node_menu
+
+        await state.update_data(
+            platform_key=platform_key,
+            section_key=section_key,
+            subsection_key=subsection_key,
+            nav_entry_id=subsection_key,
+        )
+        markup = build_catalog_node_menu(
+            subsection_key,
+            back_callback=f"order:section:{platform_key}:{section_key}",
+        )
+        title = str(nested_bucket.get("title") or "الخدمات")
+        short_body = f"<b>{title}</b>\n\nاختر:"
+        has_photo = await _living_has_photo(state, user_id)
+        text = _order_caption_text(
+            short_body, short_body, has_photo=has_photo, user_id=user_id
+        )
+        if await _edit_order_screen(
+            bot, state, user_id, text, markup, message=callback.message
+        ):
+            await _sync_living_nav_anchor(bot, state, user_id, markup)
         await callback.answer()
         return
     await _show_services(
@@ -1551,41 +2015,22 @@ async def order_enter_link_handler(message: Message, state: FSMContext, bot: Bot
     if auto_quantity:
         quantity = auto_quantity
         total_price = order_total_price_dh(service, quantity)
-        await state.update_data(confirm_quantity=quantity, confirm_total=total_price)
-        await state.set_state(OrderFlow.confirm_order)
-        confirm_bc = await _order_breadcrumb_from_state(
-            state,
-            user_id=user_id,
-            service_name=str(service["name"]),
-            step_label="تأكيد الطلب",
-        )
-        invoice_text = build_invoice_text(
-            service,
-            CURRENCY_DISPLAY,
-            quantity,
-            total_price,
-            link,
-            is_fixed_quantity=True,
-            breadcrumb_line=confirm_bc,
-        )
-        confirm_kb = build_order_confirm_keyboard()
-        await delete_flow_step_prompt(bot, state, message.chat.id)
-        await _edit_order_living_ui(
-            bot,
-            state,
-            user_id,
-            invoice_text,
-            confirm_kb,
-        )
-        await acknowledge_then_focus_living_ui(
+        await _gate_balance_then_confirm_or_fund(
             bot,
             state,
             user_id,
             message.chat.id,
-            ack_text="✅ تم حفظ معلومات الطلب — راجع التفاصيل في الرسالة أعلاه واضغط تأكيد",
-            reply_to_message_id=message.message_id,
+            service=service,
+            platform_key=platform_key,
+            section_key=section_key,
+            subsection_key=subsection_key,
+            link=link,
+            quantity=quantity,
+            total_price=total_price,
+            auto_quantity=True,
+            message=message,
+            ack_reply_to_message_id=message.message_id,
         )
-        await _sync_living_nav_anchor(bot, state, user_id, confirm_kb)
     else:
         await state.set_state(OrderFlow.enter_quantity)
         await _send_order_quantity_step_prompt(
@@ -1647,40 +2092,22 @@ async def order_enter_quantity_handler(message: Message, state: FSMContext, bot:
     await track_transcript_user_message(state, message)
 
     total_price = order_total_price_dh(service, quantity)
-    await state.update_data(confirm_quantity=quantity, confirm_total=total_price)
-    await state.set_state(OrderFlow.confirm_order)
-    confirm_bc = await _order_breadcrumb_from_state(
-        state,
-        user_id=user_id,
-        service_name=str(service["name"]),
-        step_label="تأكيد الطلب",
-    )
-    invoice_text = build_invoice_text(
-        service,
-        CURRENCY_DISPLAY,
-        quantity,
-        total_price,
-        link,
-        breadcrumb_line=confirm_bc,
-    )
-    confirm_kb = build_order_confirm_keyboard()
-    await delete_flow_step_prompt(bot, state, message.chat.id)
-    await _edit_order_living_ui(
-        bot,
-        state,
-        user_id,
-        invoice_text,
-        confirm_kb,
-    )
-    await acknowledge_then_focus_living_ui(
+    await _gate_balance_then_confirm_or_fund(
         bot,
         state,
         user_id,
         message.chat.id,
-        ack_text="✅ تم حفظ معلومات الطلب — راجع التفاصيل في الرسالة أعلاه واضغط تأكيد",
-        reply_to_message_id=message.message_id,
+        service=service,
+        platform_key=platform_key,
+        section_key=section_key,
+        subsection_key=subsection_key,
+        link=link,
+        quantity=quantity,
+        total_price=total_price,
+        auto_quantity=False,
+        message=message,
+        ack_reply_to_message_id=message.message_id,
     )
-    await _sync_living_nav_anchor(bot, state, user_id, confirm_kb)
 
 
 @router.callback_query(F.data == CB_ORDER_OTHER_SERVICES)
@@ -1834,6 +2261,16 @@ async def _handle_back_navigation(callback: CallbackQuery, state: FSMContext, bo
     msg = callback.message
 
     if current_state == OrderFlow.confirm_order.state:
+        # Drop durable funding intent when leaving confirmation / funding root.
+        pending_id = data.get(PENDING_FUNDING_INTENT_ID_KEY)
+        if pending_id is not None:
+            try:
+                delete_pending_order_funding_by_intent(int(pending_id), user_id)
+            except (TypeError, ValueError):
+                delete_pending_order_funding(user_id)
+        await state.update_data(
+            **{PENDING_FUNDING_INTENT_ID_KEY: None, ORDER_FUND_CONTEXT_KEY: False}
+        )
         service_id = str(data.get("service_id", ""))
         located = await _sync_service_context_in_state(state, service_id)
         if not located:
@@ -2180,69 +2617,21 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
     service_category = " ".join(
         _trail_from_order_context(platform_key, section_key, subsection_key)
     )
-    try:
-        provider_creds = get_provider_credentials_for_service(
-            service, service_category
-        )
-    except RuntimeError as exc:
-        await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
-        await _edit_order_result(
-            callback,
-            state,
-            bot,
-            user_id,
-            "<b>تعذر تنفيذ الطلب:</b> إعداد مفاتيح المزود غير مكتمل.\n"
-            f"{exc}",
-            _home(user_id),
-        )
-        await callback.answer()
-        return
 
-    api_account = provider_creds["account_type"]
-    provider_slug = provider_creds["provider_slug"]
-    snapshot_provider_cost = provider_cost_dh_from_service(service, quantity)
-    # Phase 8G — freeze execution identity before persist/submit (TEXT, no int).
-    external_snap = str(service.get("external_service_id_text") or "").strip()
-    if not external_snap:
-        # Do not invent from local_item_id / catalog_id equality coincidence.
-        raw_ext = service.get("external_service_id")
-        if raw_ext is not None and str(raw_ext).strip() and str(raw_ext).strip() != "0":
-            external_snap = str(raw_ext).strip()
-    legacy_catalog_id = str(service.get("catalog_id") or "").strip()
-    if not external_snap:
-        await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
-        await _edit_order_result(
-            callback,
-            state,
-            bot,
-            user_id,
-            "<b>تعذر تنفيذ الطلب:</b> معرّف تنفيذ المزوّد غير متوفر لهذه الخدمة.",
-            _home(user_id),
-        )
-        await callback.answer()
-        return
-
-    create_kwargs = dict(
-        user_id=user_id,
-        service_name=str(service["name"]),
-        service_id=str(service["id"]),
-        link=link,
-        quantity=quantity,
-        amount=to_float(total_price),
-        api_account=api_account,
-        provider_slug=provider_slug,
-        provider_cost_dh=snapshot_provider_cost,
-        catalog_id=legacy_catalog_id or None,
-        external_service_id_snapshot=external_snap,
-    )
-
-    # Phase 9Q / controlled pilot — Catalog Order Intent for Catalog-routed services.
-    # Default production backend is Legacy; pilot uses uses_catalog_order_contract.
+    # Catalog SoT: resolve Order Intent first — do not pre-resolve via Legacy smm_services.
     storefront = get_storefront()
     use_catalog_contract = storefront.backend_name == "catalog" or (
         hasattr(storefront, "uses_catalog_order_contract")
         and storefront.uses_catalog_order_contract(str(service["id"]))
     )
+
+    api_account = "default"
+    provider_slug = ""
+    snapshot_provider_cost = 0.0
+    external_snap = ""
+    legacy_catalog_id = str(service.get("catalog_id") or "").strip()
+    create_kwargs: dict = {}
+
     if use_catalog_contract:
         from catalog_core.storefront_adapter import StorefrontAdapterError
         from storefront import order_intent_to_create_bridge
@@ -2251,14 +2640,17 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
             intent = storefront.resolve_order_intent(
                 str(service["id"]), quantity, target=link
             )
-            bridge = order_intent_to_create_bridge(intent, user_id=user_id)
+            conn = getattr(storefront, "_connection", None)
+            bridge = order_intent_to_create_bridge(
+                intent, user_id=user_id, connection=conn
+            )
             create_kwargs = bridge.to_create_kwargs()
-            create_kwargs["provider_cost_dh"] = snapshot_provider_cost
             external_snap = bridge.external_service_id_snapshot
             api_account = bridge.api_account
             provider_slug = bridge.provider_slug
             total_price = to_decimal(bridge.amount_dh)
             requires_admin = str(bridge.fulfillment_mode).lower() == "admin"
+            snapshot_provider_cost = float(bridge.provider_cost_dh or 0)
         except StorefrontAdapterError as exc:
             await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
             await _edit_order_result(
@@ -2271,6 +2663,114 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
             )
             await callback.answer()
             return
+    else:
+        try:
+            provider_creds = get_provider_credentials_for_service(
+                service, service_category
+            )
+        except RuntimeError as exc:
+            await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+            await _edit_order_result(
+                callback,
+                state,
+                bot,
+                user_id,
+                "<b>تعذر تنفيذ الطلب:</b> إعداد مفاتيح المزود غير مكتمل.\n"
+                f"{exc}",
+                _home(user_id),
+            )
+            await callback.answer()
+            return
+
+        api_account = provider_creds["account_type"]
+        provider_slug = provider_creds["provider_slug"]
+        snapshot_provider_cost = provider_cost_dh_from_service(service, quantity)
+        external_snap = str(service.get("external_service_id_text") or "").strip()
+        if not external_snap:
+            raw_ext = service.get("external_service_id")
+            if raw_ext is not None and str(raw_ext).strip() and str(raw_ext).strip() != "0":
+                external_snap = str(raw_ext).strip()
+        if not external_snap:
+            await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+            await _edit_order_result(
+                callback,
+                state,
+                bot,
+                user_id,
+                "<b>تعذر تنفيذ الطلب:</b> معرّف تنفيذ المزوّد غير متوفر لهذه الخدمة.",
+                _home(user_id),
+            )
+            await callback.answer()
+            return
+
+        create_kwargs = dict(
+            user_id=user_id,
+            service_name=str(service["name"]),
+            service_id=str(service["id"]),
+            link=link,
+            quantity=quantity,
+            amount=to_float(total_price),
+            api_account=api_account,
+            provider_slug=provider_slug,
+            provider_cost_dh=snapshot_provider_cost,
+            catalog_id=legacy_catalog_id or None,
+            external_service_id_snapshot=external_snap,
+        )
+
+    funding_intent_raw = data.get(PENDING_FUNDING_INTENT_ID_KEY)
+    funding_intent_id: int | None = None
+    if funding_intent_raw is not None:
+        try:
+            funding_intent_id = int(funding_intent_raw)
+        except (TypeError, ValueError):
+            funding_intent_id = None
+        if funding_intent_id is not None:
+            # Stale callback: intent gone or replaced → abort before debit.
+            if get_pending_order_funding_by_intent(funding_intent_id, user_id) is None:
+                await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+                await _edit_order_result(
+                    callback,
+                    state,
+                    bot,
+                    user_id,
+                    "انتهت صلاحية تأكيد هذا الطلب (أُلغي أو استُبدل). ابدأ طلباً جديداً.",
+                    _home(user_id),
+                )
+                await callback.answer()
+                return
+            intent_row = get_pending_order_funding_by_intent(funding_intent_id, user_id)
+            if intent_row is not None:
+                if str(intent_row["service_id"]) != str(service["id"]) or str(
+                    intent_row["link"]
+                ) != str(link):
+                    delete_pending_order_funding_by_intent(funding_intent_id, user_id)
+                    await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+                    await _edit_order_result(
+                        callback,
+                        state,
+                        bot,
+                        user_id,
+                        build_pending_invalidated_html(),
+                        _home(user_id),
+                    )
+                    await callback.answer()
+                    return
+                if not intent_price_matches_live(intent_row, total_price):
+                    delete_pending_order_funding_by_intent(funding_intent_id, user_id)
+                    await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+                    await _edit_order_result(
+                        callback,
+                        state,
+                        bot,
+                        user_id,
+                        "تغير سعر الخدمة أثناء إعداد الطلب. لم يتم تنفيذ الطلب، يرجى إنشاء الطلب من جديد لعرض السعر الصحيح.",
+                        _home(user_id),
+                    )
+                    await callback.answer()
+                    return
+
+    # (Catalog contract already applied above when use_catalog_contract.)
+    _ = use_catalog_contract  # retained for clarity / future branches
 
     # Active-link guard: block before balance hold / provider submission.
     # Keep OrderFlow.confirm_order so «رجوع» returns to quantity/link via order:nav:back.
@@ -2297,7 +2797,20 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         return
 
     try:
-        if requires_admin:
+        if funding_intent_id is not None:
+            if requires_admin:
+                order_id = create_order_with_balance_hold_consuming_funding_intent(
+                    funding_intent_id,
+                    **create_kwargs,
+                    initial_status="pending_admin",
+                    fulfillment_mode=FULFILLMENT_ADMIN,
+                )
+            else:
+                order_id = create_order_with_balance_hold_consuming_funding_intent(
+                    funding_intent_id,
+                    **create_kwargs,
+                )
+        elif requires_admin:
             order_id = create_order_with_balance_hold(
                 **create_kwargs,
                 initial_status="pending_admin",
@@ -2329,6 +2842,35 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
             service_name=str(service["name"]),
             step_label="تأكيد الطلب",
         )
+        if funding_intent_id is not None and get_pending_order_funding_by_intent(
+            funding_intent_id, user_id
+        ) is None:
+            await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+            await _edit_order_result(
+                callback,
+                state,
+                bot,
+                user_id,
+                "انتهت صلاحية تأكيد هذا الطلب (أُلغي أو استُبدل). ابدأ طلباً جديداً.",
+                _home(user_id),
+            )
+            await callback.answer()
+            return
+        # Rare race: balance dipped after gate — stay in order-funding context.
+        if funding_intent_id is None:
+            intent_id = upsert_pending_order_funding(
+                user_id,
+                service_id=str(service["id"]),
+                service_name=str(service["name"]),
+                platform_key=platform_key,
+                section_key=section_key,
+                subsection_key=subsection_key,
+                link=link,
+                quantity=quantity,
+                amount_dh=to_float(total_price),
+                auto_quantity=auto_qty is not None,
+            )
+            await state.update_data(**{PENDING_FUNDING_INTENT_ID_KEY: intent_id})
         await _edit_order_result(
             callback,
             state,
@@ -2477,4 +3019,188 @@ async def order_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
     success_nav = build_order_success_nav_keyboard()
     await _edit_order_result(callback, state, bot, user_id, receipt, success_nav)
     await _sync_living_nav_anchor(bot, state, user_id, success_nav)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Order-funding context (order_fund:*) — deposit reuse without menu:deposit
+# ---------------------------------------------------------------------------
+
+
+async def _ensure_pending_funding_or_abort(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+) -> int | None:
+    """Return intent_id if durable pending exists; otherwise abort UI."""
+    if not callback.from_user:
+        return None
+    user_id = callback.from_user.id
+    data = await state.get_data()
+    raw = data.get(PENDING_FUNDING_INTENT_ID_KEY)
+    intent = None
+    if raw is not None:
+        try:
+            intent = get_pending_order_funding_by_intent(int(raw), user_id)
+        except (TypeError, ValueError):
+            intent = None
+    if intent is None:
+        intent = get_pending_order_funding(user_id)
+    if intent is None:
+        await callback.answer("لا يوجد طلب معلق للتمويل.", show_alert=True)
+        return None
+    intent_id = int(intent["intent_id"])
+    await state.update_data(
+        **{
+            PENDING_FUNDING_INTENT_ID_KEY: intent_id,
+            ORDER_FUND_CONTEXT_KEY: True,
+            "service_id": intent["service_id"],
+            "link": intent["link"],
+            "confirm_quantity": intent["quantity"],
+            "confirm_total": intent["amount_dh"],
+            "platform_key": intent["platform_key"],
+            "section_key": intent.get("section_key") or "",
+            "subsection_key": intent.get("subsection_key") or "",
+        }
+    )
+    return intent_id
+
+
+@router.callback_query(F.data == "order_fund:open")
+async def order_fund_open_handler(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    intent_id = await _ensure_pending_funding_or_abort(callback, state, bot)
+    if intent_id is None:
+        return
+    user_id = callback.from_user.id
+    intent = get_pending_order_funding_by_intent(intent_id, user_id)
+    if intent is None:
+        await callback.answer("لا يوجد طلب معلق للتمويل.", show_alert=True)
+        return
+    resolved = resolve_live_total_for_intent(intent)
+    if resolved is None or not intent_price_matches_live(intent, resolved[1]):
+        delete_pending_order_funding_by_intent(intent_id, user_id)
+        await _edit_order_living_ui(
+            bot, state, user_id, build_pending_invalidated_html(), _home(user_id)
+        )
+        await state.clear()
+        await callback.answer()
+        return
+    _service, live_total = resolved
+    await _show_order_funding_screen(
+        bot,
+        state,
+        user_id,
+        order_total=to_float(live_total),
+        balance=_user_balance_amount(user_id),
+        service_name=str(intent["service_name"]),
+        message=callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "order_fund:cancel")
+async def order_fund_cancel_handler(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    user_id = callback.from_user.id
+    data = await state.get_data()
+    raw = data.get(PENDING_FUNDING_INTENT_ID_KEY)
+    if raw is not None:
+        try:
+            delete_pending_order_funding_by_intent(int(raw), user_id)
+        except (TypeError, ValueError):
+            delete_pending_order_funding(user_id)
+    else:
+        delete_pending_order_funding(user_id)
+    await _finish_order_flow(bot, state, user_id, callback.message.chat.id)
+    await _edit_order_living_ui(
+        bot,
+        state,
+        user_id,
+        "<b>تم إلغاء الطلب المعلق.</b>\nرصيدك المضاف يبقى في حسابك.",
+        _home(user_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "order_fund:back")
+async def order_fund_back_handler(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    """Funding-root Back: cancel pending intent + one order step backward."""
+    if not callback.from_user or not callback.message:
+        return
+    current = await state.get_state()
+    data = await state.get_data()
+    # Nested deposit screens use deposit:back (context-aware). This is funding root.
+    if current and str(current).startswith("DepositFlow"):
+        # Safety: treat as return to funding methods without deleting intent.
+        intent_id = await _ensure_pending_funding_or_abort(callback, state, bot)
+        if intent_id is None:
+            return
+        user_id = callback.from_user.id
+        intent = get_pending_order_funding_by_intent(intent_id, user_id)
+        if intent is None:
+            await callback.answer()
+            return
+        await delete_flow_step_prompt(bot, state, callback.message.chat.id)
+        await _show_order_funding_screen(
+            bot,
+            state,
+            user_id,
+            order_total=float(intent["amount_dh"]),
+            balance=_user_balance_amount(user_id),
+            service_name=str(intent["service_name"]),
+            message=callback.message,
+        )
+        await callback.answer()
+        return
+
+    await clear_last_prompt(callback.message, state, bot=bot)
+    # Ensure confirm_order so _handle_back_navigation deletes intent + goes back.
+    await state.set_state(OrderFlow.confirm_order)
+    if data.get(PENDING_FUNDING_INTENT_ID_KEY) is None:
+        intent = get_pending_order_funding(callback.from_user.id)
+        if intent is not None:
+            await state.update_data(**{PENDING_FUNDING_INTENT_ID_KEY: intent["intent_id"]})
+    await _handle_back_navigation(callback, state, bot)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("order_fund:bank:"))
+async def order_fund_bank_handler(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    from handlers.payment import start_order_fund_bank_deposit
+
+    intent_id = await _ensure_pending_funding_or_abort(callback, state, bot)
+    if intent_id is None:
+        return
+    method_key = (callback.data or "").split(":", maxsplit=2)[-1]
+    ok = await start_order_fund_bank_deposit(callback, state, bot, method_key=method_key)
+    if not ok:
+        await callback.answer("وسيلة الدفع غير معروفة", show_alert=True)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data == "order_fund:recharge")
+async def order_fund_recharge_handler(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    from handlers.payment import start_order_fund_recharge
+
+    intent_id = await _ensure_pending_funding_or_abort(callback, state, bot)
+    if intent_id is None:
+        return
+    await start_order_fund_recharge(callback, state, bot)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "order_fund:other_method")
+async def order_fund_other_method_handler(
+    callback: CallbackQuery, state: FSMContext, bot: Bot
+) -> None:
+    from handlers.payment import start_order_fund_other_method
+
+    intent_id = await _ensure_pending_funding_or_abort(callback, state, bot)
+    if intent_id is None:
+        return
+    await start_order_fund_other_method(callback, state, bot)
     await callback.answer()

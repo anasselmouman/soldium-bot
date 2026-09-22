@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Iterator, TypedDict
 
 from config import MIN_REFERRAL_WITHDRAW_DH
-from utils.money import to_float
+from utils.money import to_decimal, to_float
 from utils.order_status_ar import normalize_order_status_key
 
 DB_PATH = Path(__file__).with_name("users.db")
@@ -227,6 +227,22 @@ class OrderRecord(TypedDict):
     api_account: str
     provider_slug: str
     provider_cost_dh: float
+
+
+class PendingOrderFundingRecord(TypedDict):
+    intent_id: int
+    user_id: int
+    service_id: str
+    service_name: str
+    platform_key: str
+    section_key: str | None
+    subsection_key: str | None
+    link: str
+    quantity: int
+    amount_dh: float
+    auto_quantity: int
+    created_at: str
+    updated_at: str
 
 
 def _order_row_to_record(row: sqlite3.Row) -> OrderRecord:
@@ -534,6 +550,7 @@ def pending_init_db_migrations(*, db_path: Path | None = None) -> list[str]:
             "admin_alerts",
             "admin_notifications",
             "pending_referral_level_upgrades",
+            "pending_order_funding",
             "smm_services",
             "providers",
             "provider_accounts",
@@ -563,6 +580,7 @@ def pending_init_db_migrations(*, db_path: Path | None = None) -> list[str]:
             "status_changed_at",
             "catalog_id",
             "external_service_id_snapshot",
+            "soldium_service_id",
             "normalized_link",
             "provider_slug",
         ):
@@ -1016,6 +1034,15 @@ def _apply_init_db_schema_and_migrations() -> None:
             connection.execute(
                 "ALTER TABLE orders ADD COLUMN external_service_id_snapshot TEXT"
             )
+        # Catalog SoT — immutable soldium svc_* identity for NEW Catalog orders.
+        if "soldium_service_id" not in order_columns:
+            connection.execute("ALTER TABLE orders ADD COLUMN soldium_service_id TEXT")
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_orders_soldium_service
+            ON orders (soldium_service_id)
+            """
+        )
 
         _migrate_orders_active_link_guard(connection)
 
@@ -1248,6 +1275,27 @@ def _apply_init_db_schema_and_migrations() -> None:
         )
 
         _backfill_orders_amount_from_total_price(connection)
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_order_funding (
+                intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL UNIQUE,
+                service_id TEXT NOT NULL,
+                service_name TEXT NOT NULL,
+                platform_key TEXT NOT NULL,
+                section_key TEXT,
+                subsection_key TEXT,
+                link TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                amount_dh REAL NOT NULL,
+                auto_quantity INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+            """
+        )
 
         connection.execute(
             """
@@ -1666,6 +1714,7 @@ def create_order_with_balance_hold(
     provider_cost_dh: float = 0.0,
     catalog_id: str | None = None,
     external_service_id_snapshot: str | None = None,
+    soldium_service_id: str | None = None,
 ) -> int | None:
     """Create order and debit balance atomically.
 
@@ -1739,34 +1788,70 @@ def create_order_with_balance_hold(
             mode = "auto"
         legacy_catalog_id = str(catalog_id or "").strip() or None
         external_snap = str(external_service_id_snapshot or "").strip() or None
+        soldium_id = str(soldium_service_id or "").strip() or None
+        order_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(orders)").fetchall()
+        }
+        has_soldium = "soldium_service_id" in order_columns
         try:
-            order_cursor = connection.execute(
-                """
-                INSERT INTO orders (
-                    user_id, service_name, service_id, link, quantity, amount, total_price, status,
-                    api_account, provider_slug, fulfillment_mode, provider_cost_dh,
-                    catalog_id, external_service_id_snapshot, normalized_link
+            if has_soldium:
+                order_cursor = connection.execute(
+                    """
+                    INSERT INTO orders (
+                        user_id, service_name, service_id, link, quantity, amount, total_price, status,
+                        api_account, provider_slug, fulfillment_mode, provider_cost_dh,
+                        catalog_id, external_service_id_snapshot, soldium_service_id, normalized_link
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        service_name,
+                        service_id,
+                        stored_link,
+                        quantity,
+                        amount_money,
+                        amount_money,
+                        status,
+                        account,
+                        slug,
+                        mode,
+                        round(to_float(provider_cost_dh), 6),
+                        legacy_catalog_id,
+                        external_snap,
+                        soldium_id,
+                        normalized_for_db,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    service_name,
-                    service_id,
-                    stored_link,
-                    quantity,
-                    amount_money,
-                    amount_money,
-                    status,
-                    account,
-                    slug,
-                    mode,
-                    round(to_float(provider_cost_dh), 6),
-                    legacy_catalog_id,
-                    external_snap,
-                    normalized_for_db,
-                ),
-            )
+            else:
+                order_cursor = connection.execute(
+                    """
+                    INSERT INTO orders (
+                        user_id, service_name, service_id, link, quantity, amount, total_price, status,
+                        api_account, provider_slug, fulfillment_mode, provider_cost_dh,
+                        catalog_id, external_service_id_snapshot, normalized_link
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        service_name,
+                        service_id,
+                        stored_link,
+                        quantity,
+                        amount_money,
+                        amount_money,
+                        status,
+                        account,
+                        slug,
+                        mode,
+                        round(to_float(provider_cost_dh), 6),
+                        legacy_catalog_id,
+                        external_snap,
+                        normalized_for_db,
+                    ),
+                )
         except sqlite3.IntegrityError as exc:
             connection.rollback()
             from utils.active_link_guard import is_active_link_unique_violation
@@ -1780,6 +1865,335 @@ def create_order_with_balance_hold(
                     normalized_link=normalized_for_db,
                 ) from exc
             raise
+        connection.commit()
+        return int(order_cursor.lastrowid)
+
+
+def _pending_order_funding_from_row(row: sqlite3.Row) -> PendingOrderFundingRecord:
+    section = row["section_key"]
+    subsection = row["subsection_key"]
+    return {
+        "intent_id": int(row["intent_id"]),
+        "user_id": int(row["user_id"]),
+        "service_id": str(row["service_id"]),
+        "service_name": str(row["service_name"]),
+        "platform_key": str(row["platform_key"]),
+        "section_key": str(section) if section is not None and str(section) != "" else None,
+        "subsection_key": (
+            str(subsection) if subsection is not None and str(subsection) != "" else None
+        ),
+        "link": str(row["link"] or ""),
+        "quantity": int(row["quantity"]),
+        "amount_dh": float(row["amount_dh"]),
+        "auto_quantity": int(row["auto_quantity"] or 0),
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+    }
+
+
+def upsert_pending_order_funding(
+    user_id: int,
+    *,
+    service_id: str,
+    service_name: str,
+    platform_key: str,
+    section_key: str | None,
+    subsection_key: str | None,
+    link: str,
+    quantity: int,
+    amount_dh: float,
+    auto_quantity: bool,
+) -> int:
+    """Replace any existing pending intent for ``user_id`` with a NEW ``intent_id``."""
+    amount_money = to_float(amount_dh)
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "DELETE FROM pending_order_funding WHERE user_id = ?",
+            (user_id,),
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO pending_order_funding (
+                user_id, service_id, service_name, platform_key, section_key, subsection_key,
+                link, quantity, amount_dh, auto_quantity, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                user_id,
+                str(service_id),
+                str(service_name),
+                str(platform_key or ""),
+                (str(section_key) if section_key else None),
+                (str(subsection_key) if subsection_key else None),
+                str(link or ""),
+                int(quantity),
+                amount_money,
+                1 if auto_quantity else 0,
+            ),
+        )
+        connection.commit()
+        return int(cursor.lastrowid)
+
+
+def get_pending_order_funding(user_id: int) -> PendingOrderFundingRecord | None:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT intent_id, user_id, service_id, service_name, platform_key, section_key,
+                   subsection_key, link, quantity, amount_dh, auto_quantity, created_at, updated_at
+            FROM pending_order_funding
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return _pending_order_funding_from_row(row)
+
+
+def get_pending_order_funding_by_intent(
+    intent_id: int,
+    user_id: int,
+) -> PendingOrderFundingRecord | None:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT intent_id, user_id, service_id, service_name, platform_key, section_key,
+                   subsection_key, link, quantity, amount_dh, auto_quantity, created_at, updated_at
+            FROM pending_order_funding
+            WHERE intent_id = ? AND user_id = ?
+            """,
+            (int(intent_id), int(user_id)),
+        ).fetchone()
+    if row is None:
+        return None
+    return _pending_order_funding_from_row(row)
+
+
+def delete_pending_order_funding(user_id: int) -> bool:
+    """Delete the current pending intent for ``user_id`` (if any)."""
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
+            "DELETE FROM pending_order_funding WHERE user_id = ?",
+            (user_id,),
+        )
+        connection.commit()
+        return cursor.rowcount > 0
+
+
+def delete_pending_order_funding_by_intent(intent_id: int, user_id: int) -> bool:
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
+            "DELETE FROM pending_order_funding WHERE intent_id = ? AND user_id = ?",
+            (int(intent_id), int(user_id)),
+        )
+        connection.commit()
+        return cursor.rowcount > 0
+
+
+def create_order_with_balance_hold_consuming_funding_intent(
+    intent_id: int,
+    user_id: int,
+    service_name: str,
+    service_id: str,
+    link: str,
+    quantity: int,
+    amount: float,
+    *,
+    api_account: str = "default",
+    provider_slug: str | None = None,
+    initial_status: str = "pending",
+    fulfillment_mode: str = "auto",
+    provider_cost_dh: float = 0.0,
+    catalog_id: str | None = None,
+    external_service_id_snapshot: str | None = None,
+    soldium_service_id: str | None = None,
+) -> int | None:
+    """Atomic: verify intent snapshot → debit → insert order → delete SAME intent.
+
+    Returns ``None`` when intent missing/mismatched or balance insufficient.
+    Raises ``ActiveLinkOccupiedError`` on active-link conflict (intent preserved).
+    """
+    from utils.active_link_guard import (
+        ActiveLinkOccupiedError,
+        find_active_order_for_link,
+        is_active_link_order_status,
+        normalize_order_link,
+    )
+
+    amount_money = to_float(amount)
+    stored_link = str(link or "")
+    normalized = normalize_order_link(stored_link)
+    normalized_for_db = normalized or None
+    charge_service_id = str(service_id)
+    charge_quantity = int(quantity)
+
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        intent_row = connection.execute(
+            """
+            SELECT intent_id, user_id, service_id, link, quantity, amount_dh
+            FROM pending_order_funding
+            WHERE intent_id = ? AND user_id = ?
+            """,
+            (int(intent_id), int(user_id)),
+        ).fetchone()
+        if intent_row is None:
+            connection.rollback()
+            return None
+
+        # Bind charge payload to the durable snapshot (same TX).
+        intent_link = str(intent_row["link"] or "")
+        if (
+            str(intent_row["service_id"]) != charge_service_id
+            or int(intent_row["quantity"]) != charge_quantity
+            or to_decimal(intent_row["amount_dh"]) != to_decimal(amount_money)
+            or intent_link.strip() != stored_link.strip()
+        ):
+            connection.rollback()
+            return None
+
+        user_row = connection.execute(
+            "SELECT balance FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if user_row is None:
+            connection.rollback()
+            return None
+
+        balance = float(user_row["balance"])
+        if balance < amount_money:
+            connection.rollback()
+            return None
+
+        status = str(initial_status or "pending").strip() or "pending"
+        if normalized_for_db and is_active_link_order_status(status):
+            occupied = find_active_order_for_link(connection, stored_link)
+            if occupied is not None:
+                connection.rollback()
+                raise ActiveLinkOccupiedError(
+                    existing_order_id=int(occupied["id"]),
+                    normalized_link=normalized_for_db,
+                )
+
+        balance_cursor = connection.execute(
+            """
+            UPDATE users
+            SET
+                balance = ROUND(balance - ?, 6),
+                total_spent = ROUND(total_spent + ?, 6)
+            WHERE user_id = ? AND balance >= ?
+            """,
+            (amount_money, amount_money, user_id, amount_money),
+        )
+        if balance_cursor.rowcount == 0:
+            connection.rollback()
+            return None
+
+        account = str(api_account or "default").strip() or "default"
+        slug = str(provider_slug or "").strip().lower()
+        if not slug:
+            try:
+                from services.provider_registry import get_default_provider_slug
+
+                slug = get_default_provider_slug()
+            except Exception:
+                slug = "gozibra"
+        mode = str(fulfillment_mode or "auto").strip().lower() or "auto"
+        if mode not in {"auto", "admin"}:
+            mode = "auto"
+        legacy_catalog_id = str(catalog_id or "").strip() or None
+        external_snap = str(external_service_id_snapshot or "").strip() or None
+        soldium_id = str(soldium_service_id or "").strip() or None
+        order_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(orders)").fetchall()
+        }
+        has_soldium = "soldium_service_id" in order_columns
+        try:
+            if has_soldium:
+                order_cursor = connection.execute(
+                    """
+                    INSERT INTO orders (
+                        user_id, service_name, service_id, link, quantity, amount, total_price, status,
+                        api_account, provider_slug, fulfillment_mode, provider_cost_dh,
+                        catalog_id, external_service_id_snapshot, soldium_service_id, normalized_link
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        service_name,
+                        service_id,
+                        stored_link,
+                        quantity,
+                        amount_money,
+                        amount_money,
+                        status,
+                        account,
+                        slug,
+                        mode,
+                        round(to_float(provider_cost_dh), 6),
+                        legacy_catalog_id,
+                        external_snap,
+                        soldium_id,
+                        normalized_for_db,
+                    ),
+                )
+            else:
+                order_cursor = connection.execute(
+                    """
+                    INSERT INTO orders (
+                        user_id, service_name, service_id, link, quantity, amount, total_price, status,
+                        api_account, provider_slug, fulfillment_mode, provider_cost_dh,
+                        catalog_id, external_service_id_snapshot, normalized_link
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        service_name,
+                        service_id,
+                        stored_link,
+                        quantity,
+                        amount_money,
+                        amount_money,
+                        status,
+                        account,
+                        slug,
+                        mode,
+                        round(to_float(provider_cost_dh), 6),
+                        legacy_catalog_id,
+                        external_snap,
+                        normalized_for_db,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            from utils.active_link_guard import is_active_link_unique_violation
+
+            if normalized_for_db and is_active_link_unique_violation(exc):
+                occupied = find_active_order_for_link(connection, stored_link)
+                raise ActiveLinkOccupiedError(
+                    existing_order_id=(
+                        int(occupied["id"]) if occupied is not None else None
+                    ),
+                    normalized_link=normalized_for_db,
+                ) from exc
+            raise
+
+        del_cursor = connection.execute(
+            "DELETE FROM pending_order_funding WHERE intent_id = ? AND user_id = ?",
+            (int(intent_id), int(user_id)),
+        )
+        if del_cursor.rowcount == 0:
+            connection.rollback()
+            return None
+
         connection.commit()
         return int(order_cursor.lastrowid)
 

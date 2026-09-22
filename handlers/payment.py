@@ -26,7 +26,6 @@ from config import (
     MIN_DEPOSIT_DH,
     MIN_PAYPAL_DEPOSIT_USD,
     RECHARGE_CREDIT_RATIO,
-    USDT_TO_DH_RATE,
 )
 from database import (
     add_user,
@@ -46,6 +45,11 @@ from database import (
     get_user_withdrawals,
     recharge_code_in_use,
     update_pending_deposit_status,
+)
+# Bind bot ``services`` before keyboards.payment → storefront mutates sys.path.
+from services.order_funding import (
+    ORDER_FUND_CONTEXT_KEY,
+    PENDING_FUNDING_INTENT_ID_KEY,
 )
 from keyboards.payment import (
     build_admin_deposit_actions,
@@ -148,6 +152,207 @@ RECHARGE_CODE_USED_TEXT = (
     "⚠️ هذا الرمز مُسجَّل مسبقاً (قيد المراجعة أو مُعتمد). "
     "تحقق من الرمز أو تواصل مع الدعم إن كنت تعتقد أن هناك خطأ."
 )
+
+_ORDER_FUND_PRESERVE_KEYS = (
+    ORDER_FUND_CONTEXT_KEY,
+    PENDING_FUNDING_INTENT_ID_KEY,
+    "service_id",
+    "link",
+    "confirm_quantity",
+    "confirm_total",
+    "platform_key",
+    "section_key",
+    "subsection_key",
+)
+
+
+async def _snapshot_order_fund_context(state: FSMContext) -> dict:
+    data = await state.get_data()
+    if not data.get(ORDER_FUND_CONTEXT_KEY):
+        return {}
+    return {k: data[k] for k in _ORDER_FUND_PRESERVE_KEYS if k in data}
+
+
+async def _restore_order_fund_context(state: FSMContext, snap: dict) -> None:
+    if snap:
+        await state.update_data(**snap)
+
+
+async def _clear_state_preserving_order_fund(state: FSMContext) -> dict:
+    snap = await _snapshot_order_fund_context(state)
+    await state.clear()
+    await _restore_order_fund_context(state, snap)
+    return snap
+
+
+async def _return_to_order_funding_methods(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+) -> bool:
+    """From nested deposit screens back to order-funding method list."""
+    if not callback.from_user or not callback.message:
+        return False
+    from database import get_pending_order_funding, get_pending_order_funding_by_intent
+    from handlers.orders import _show_order_funding_screen, _user_balance_amount
+    from utils.money import to_float
+
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    await delete_flow_step_prompt(bot, state, chat_id)
+    await clear_last_prompt(callback.message, state)
+    snap = await _clear_state_preserving_order_fund(state)
+    raw = snap.get(PENDING_FUNDING_INTENT_ID_KEY)
+    intent = None
+    if raw is not None:
+        try:
+            intent = get_pending_order_funding_by_intent(int(raw), user_id)
+        except (TypeError, ValueError):
+            intent = None
+    if intent is None:
+        intent = get_pending_order_funding(user_id)
+    if intent is None:
+        return False
+    await state.update_data(
+        **{
+            ORDER_FUND_CONTEXT_KEY: True,
+            PENDING_FUNDING_INTENT_ID_KEY: intent["intent_id"],
+            "service_id": intent["service_id"],
+            "link": intent["link"],
+            "confirm_quantity": intent["quantity"],
+            "confirm_total": intent["amount_dh"],
+            "platform_key": intent["platform_key"],
+            "section_key": intent.get("section_key") or "",
+            "subsection_key": intent.get("subsection_key") or "",
+        }
+    )
+    await _show_order_funding_screen(
+        bot,
+        state,
+        user_id,
+        order_total=to_float(intent["amount_dh"]),
+        balance=_user_balance_amount(user_id),
+        service_name=str(intent["service_name"]),
+        message=callback.message,
+    )
+    return True
+
+
+def _deposit_back_callback_for_state_data(data: dict) -> str:
+    if data.get(ORDER_FUND_CONTEXT_KEY):
+        return "order_fund:back"
+    return "deposit:back"
+
+
+async def start_order_fund_bank_deposit(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    *,
+    method_key: str,
+) -> bool:
+    if not callback.message or not callback.from_user:
+        return False
+    method = PAYMENT_BY_KEY.get(method_key)
+    if method is None:
+        return False
+    snap = await _snapshot_order_fund_context(state)
+    snap[ORDER_FUND_CONTEXT_KEY] = True
+    await clear_last_prompt(callback.message, state)
+    await reset_flow_transcript(state)
+    await state.set_state(DepositFlow.waiting_for_receipt)
+    await state.update_data(
+        **snap,
+        deposit_bank_key=method.key,
+        deposit_bank_label=method.ledger_name,
+    )
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    await _edit_payment_living(
+        bot,
+        state,
+        user_id,
+        _format_payment_detail_text(method),
+        None,
+        message=callback.message,
+    )
+    await _sync_payment_nav_anchor(bot, state, user_id, None)
+    await _send_payment_step_prompt(
+        bot, state, user_id, chat_id, _deposit_receipt_step_prompt(), "order_fund:back"
+    )
+    return True
+
+
+async def start_order_fund_recharge(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+) -> None:
+    snap = await _snapshot_order_fund_context(state)
+    snap[ORDER_FUND_CONTEXT_KEY] = True
+    if callback.message:
+        await clear_last_prompt(callback.message, state)
+    await state.clear()
+    await state.update_data(**snap)
+    await _edit_payment_from_callback(
+        callback,
+        state,
+        bot,
+        text=_format_recharge_telecom_selection_text(),
+        reply_markup=build_recharge_telecom_menu(),
+    )
+
+
+async def start_order_fund_other_method(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+) -> None:
+    if not callback.message or not callback.from_user:
+        return
+    snap = await _snapshot_order_fund_context(state)
+    snap[ORDER_FUND_CONTEXT_KEY] = True
+    user_id = callback.from_user.id
+    await clear_last_prompt(callback.message, state)
+    await purge_flow_transcript(bot, state, user_id, callback.message.chat.id)
+    await state.clear()
+    await state.update_data(**snap)
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from keyboards.nav_labels import BTN_BACK_STEP, attach_cross_area_nav
+    from config import SUPPORT_LINK, WHATSAPP_SUPPORT_LINK
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 تواصل مع خدمة العملاء 💬", url=SUPPORT_LINK)
+    builder.button(text="📱 تواصل عبر الواتساب 📱", url=WHATSAPP_SUPPORT_LINK)
+    builder.button(text=BTN_BACK_STEP, callback_data="order_fund:back")
+    builder.adjust(1)
+    nav = InlineKeyboardBuilder()
+    attach_cross_area_nav(nav)
+    builder.attach(nav)
+    await _edit_payment_from_callback(
+        callback,
+        state,
+        bot,
+        text=_format_deposit_other_payment_text(),
+        reply_markup=builder.as_markup(),
+        register_living=True,
+    )
+
+
+async def _maybe_resume_pending_order_after_deposit(
+    bot: Bot,
+    user_id: int,
+    *,
+    storage=None,
+) -> None:
+    from services.order_funding import resume_pending_order_after_deposit
+
+    try:
+        await resume_pending_order_after_deposit(bot, user_id, storage=storage)
+    except Exception:
+        logger.exception(
+            "resume_pending_order_after_deposit failed user_id=%s", user_id
+        )
 _DEBUG_LOG_PATH = Path(__file__).resolve().parent.parent / "debug-e94964.log"
 _DEBUG_SESSION_LOG_PATH = Path(__file__).resolve().parent.parent / "debug-2eac5b.log"
 
@@ -255,30 +460,18 @@ def _deposit_approval_title(deposit_method: str) -> str:
     return "الشحن"
 
 
-def _min_deposit_dh_for_method(deposit_method: str) -> float:
-    if is_paypal_ledger(deposit_method):
-        return to_float(MIN_PAYPAL_DEPOSIT_USD) * to_float(USDT_TO_DH_RATE)
-    if is_crypto_ledger(deposit_method):
-        return to_float(MIN_CRYPTO_DEPOSIT_USDT) * to_float(USDT_TO_DH_RATE)
-    return to_float(MIN_DEPOSIT_DH)
-
-
 def _validate_admin_deposit_amount(deposit_method: str, amount: float) -> str | None:
-    """None إذا المبلغ صالح، وإلا نص الخطأ."""
+    """None إذا المبلغ صالح، وإلا نص الخطأ.
+
+    No Admin-side method minimum: any amount > 0 (from `_parse_admin_amount`)
+    is allowed up to MAX_SINGLE_DEPOSIT_DH. deposit_method kept for callers.
+    """
+    _ = deposit_method
     if amount > to_float(MAX_SINGLE_DEPOSIT_DH):
         return (
             f"⚠️ المبلغ يتجاوز الحد الأقصى المسموح "
             f"(<b>{format_dh(MAX_SINGLE_DEPOSIT_DH)}</b>)."
         )
-    min_dh = _min_deposit_dh_for_method(deposit_method)
-    if amount < min_dh:
-        if is_paypal_ledger(deposit_method):
-            label = f"PayPal ({int(MIN_PAYPAL_DEPOSIT_USD)} USD ≈ {format_dh(min_dh)})"
-        elif is_crypto_ledger(deposit_method):
-            label = f"Crypto ({int(MIN_CRYPTO_DEPOSIT_USDT)} USDT ≈ {format_dh(min_dh)})"
-        else:
-            label = format_dh(MIN_DEPOSIT_DH)
-        return f"⚠️ الحد الأدنى للشحن عبر <b>{label}</b> هو <b>{format_dh(min_dh)}</b>."
     return None
 
 
@@ -1572,6 +1765,11 @@ async def _restore_deposit_gateway_from_step_back(
     """الرجوع لبوابة الشحن من رسالة خطوة — لا يعدّل/يسجّل رسالة الخطوة المحذوفة."""
     if not callback.message or not callback.from_user:
         return False
+    # Order-funding nested deposit: return to order_fund methods, not menu:deposit.
+    data = await state.get_data()
+    if data.get(ORDER_FUND_CONTEXT_KEY):
+        return await _return_to_order_funding_methods(callback, state, bot)
+
     user_id = callback.from_user.id
     chat_id = callback.message.chat.id
     callback_msg_id = callback.message.message_id
@@ -1789,7 +1987,7 @@ async def _render_recharge_telecom_menu(
     if not callback.message:
         return
     await clear_last_prompt(callback.message, state)
-    await state.clear()
+    await _clear_state_preserving_order_fund(state)
     await _edit_payment_from_callback(
         callback,
         state,
@@ -2052,15 +2250,18 @@ async def deposit_bank_selected_handler(callback: CallbackQuery, state: FSMConte
     if method is None:
         await callback.answer("وسيلة الدفع غير معروفة", show_alert=True)
         return
+    order_fund_snap = await _snapshot_order_fund_context(state)
     await clear_last_prompt(callback.message, state)
     await reset_flow_transcript(state)
     await state.set_state(DepositFlow.waiting_for_receipt)
     await state.update_data(
+        **order_fund_snap,
         deposit_bank_key=method.key,
         deposit_bank_label=method.ledger_name,
     )
     user_id = callback.from_user.id
     chat_id = callback.message.chat.id
+    back_cb = _deposit_back_callback_for_state_data(order_fund_snap)
     await _edit_payment_living(
         bot,
         state,
@@ -2071,7 +2272,7 @@ async def deposit_bank_selected_handler(callback: CallbackQuery, state: FSMConte
     )
     await _sync_payment_nav_anchor(bot, state, user_id, None)
     await _send_payment_step_prompt(
-        bot, state, user_id, chat_id, _deposit_receipt_step_prompt(), "deposit:back"
+        bot, state, user_id, chat_id, _deposit_receipt_step_prompt(), back_cb
     )
     await callback.answer()
 
@@ -2319,7 +2520,11 @@ async def admin_confirm_deposit_amount_handler(message: Message, state: FSMConte
     admin_notice = f"<b>✅ تمت إضافة {format_dh(balance_dh)} لرصيد المستخدم.</b>"
 
     await send_smart_notification(bot, deposit["user_id"], user_notice)
+    # Clear admin FSM first; resume must run last so same-account QA keeps confirm_order.
     await state.clear()
+    await _maybe_resume_pending_order_after_deposit(
+        bot, deposit["user_id"], storage=state.storage
+    )
     await message.answer(admin_notice, parse_mode="HTML")
 
 
@@ -2447,7 +2652,11 @@ async def admin_confirm_recharge_face_value_handler(
             f"تمت إضافة مبلغ <b>{credit_display}</b> DH بنجاح إلى رصيدك! ✅"
         ),
     )
+    # Clear admin FSM first; resume must run last so same-account QA keeps confirm_order.
     await state.clear()
+    await _maybe_resume_pending_order_after_deposit(
+        bot, deposit["user_id"], storage=state.storage
+    )
     await message.answer(
         f"<b>✅ تعبئة {escape(telecom_method)}:</b> {face_display} DH → "
         f"أُضيف <code>{format_dh(credit_dh)}</code> للمستخدم.",
