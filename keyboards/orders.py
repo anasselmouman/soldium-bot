@@ -207,6 +207,10 @@ def build_order_critical_points_markup() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+# Telegram Bot API hard limit for InlineKeyboardButton.callback_data.
+TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
+
+
 def _child_nodes(bucket: dict) -> dict:
     """Child navigable nodes: prefer sections; Catalog may nest deeper in sections."""
     return dict(bucket.get("sections") or {})
@@ -221,6 +225,32 @@ def _nested_nodes(bucket: dict) -> dict:
     return dict(bucket.get("sections") or {})
 
 
+def _catalog_child_node_callback(child_entry_id: str) -> str:
+    """Single-id Catalog node callback (restart-safe; resolves via navigation tree)."""
+    return f"order:node:{child_entry_id}"
+
+
+def _section_nav_callback(platform_key: str, section_key: str) -> str:
+    """Section open callback: Catalog uses order:node; Legacy keeps dual-key format."""
+    if _is_catalog_tree():
+        return _catalog_child_node_callback(section_key)
+    return f"order:section:{platform_key}:{section_key}"
+
+
+def _subsection_nav_callback(platform_key: str, section_key: str, sub_key: str) -> str:
+    """Subsection open callback: Catalog uses order:node; Legacy keeps o:ss: triple."""
+    if _is_catalog_tree():
+        return _catalog_child_node_callback(sub_key)
+    return f"o:ss:{platform_key}:{section_key}:{sub_key}"
+
+
+def _section_back_callback(platform_key: str, section_key: str) -> str:
+    """Back to a section screen: Catalog → order:node:{section}; Legacy dual-key."""
+    if _is_catalog_tree():
+        return _catalog_child_node_callback(section_key)
+    return f"order:section:{platform_key}:{section_key}"
+
+
 def build_sections_menu(platform_key: str) -> InlineKeyboardMarkup:
     """قائمة الأقسام الرئيسية داخل منصة / جذر كتالوج."""
     builder = InlineKeyboardBuilder()
@@ -233,7 +263,7 @@ def build_sections_menu(platform_key: str) -> InlineKeyboardMarkup:
             continue
         builder.button(
             text=str(section.get("title", "قسم")),
-            callback_data=f"order:section:{platform_key}:{section_key}",
+            callback_data=_section_nav_callback(platform_key, section_key),
         )
         sections_count += 1
 
@@ -273,10 +303,9 @@ def build_subsections_menu(platform_key: str, section_key: str) -> InlineKeyboar
         # Avoid treating the same dict as both items-host and nested self
         if sub_key == section_key:
             continue
-        callback_data = f"o:ss:{platform_key}:{section_key}:{sub_key}"
         builder.button(
             text=str(sub.get("title", "فرعي")),
-            callback_data=callback_data,
+            callback_data=_subsection_nav_callback(platform_key, section_key, sub_key),
         )
 
     back_cb = f"order:platform:{platform_key}"
@@ -305,9 +334,9 @@ def build_services_menu(
         for deep_key, deep in deeper.items():
             builder.button(
                 text=str(deep.get("title", "قسم")),
-                callback_data=f"order:node:{deep_key}",
+                callback_data=_catalog_child_node_callback(deep_key),
             )
-        back_callback = f"order:section:{platform_key}:{section_key}"
+        back_callback = _section_back_callback(str(platform_key), str(section_key))
     elif not section_key or str(section_key).lower() in {"none", "direct"}:
         items = list(category.get("direct_items") or [])
         if not items and _is_catalog_tree():
@@ -351,7 +380,7 @@ def build_catalog_node_menu(entry_id: str, *, back_callback: str) -> InlineKeybo
     for child_key, child in _child_nodes(node).items():
         builder.button(
             text=str(child.get("title", "قسم")),
-            callback_data=f"order:node:{child_key}",
+            callback_data=_catalog_child_node_callback(child_key),
         )
     for item in list(node.get("items") or []) + list(node.get("direct_items") or []):
         builder.button(
@@ -388,11 +417,56 @@ def _find_catalog_node(entry_id: str) -> dict | None:
                 return found
         return None
 
-    for root in _services().values():
+    for root_key, root in _services().items():
+        # Root buckets are keyed by entry id; entry_id field may also match.
+        if str(root_key) == eid:
+            return root or {}
         found = walk(root or {})
         if found is not None:
             return found
     return None
+
+
+def _find_catalog_parent_entry_id(entry_id: str) -> str | None:
+    """Parent Catalog entry id for back-navigation (from durable navigation tree)."""
+    eid = str(entry_id or "").strip()
+    if not eid:
+        return None
+
+    def walk(bucket: dict, parent_id: str | None) -> str | None:
+        for child_key, child in _child_nodes(bucket).items():
+            if str(child_key) == eid or str(child.get("entry_id") or "") == eid:
+                return parent_id
+            found = walk(child, str(child_key))
+            if found is not None:
+                return found
+        for child_key, child in (bucket.get("subsections") or {}).items():
+            if str(child_key) == eid or str(child.get("entry_id") or "") == eid:
+                return parent_id
+            found = walk(child, str(child_key))
+            if found is not None:
+                return found
+        return None
+
+    for root_key, root in _services().items():
+        if str(root_key) == eid:
+            return None
+        found = walk(root or {}, str(root_key))
+        if found is not None:
+            return found
+    return None
+
+
+def catalog_node_back_callback(entry_id: str, *, platform_key: str | None = None) -> str:
+    """Safe back callback for a Catalog node (always ≤64 bytes)."""
+    parent_id = _find_catalog_parent_entry_id(entry_id)
+    if parent_id and parent_id in _services():
+        return f"order:platform:{parent_id}"
+    if parent_id:
+        return _catalog_child_node_callback(parent_id)
+    if platform_key:
+        return f"order:platform:{platform_key}"
+    return "order:nav:platforms"
 
 
 def build_auto_interactions_disclaimer_keyboard() -> InlineKeyboardMarkup:
