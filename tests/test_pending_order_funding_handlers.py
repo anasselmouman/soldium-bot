@@ -555,6 +555,13 @@ def test_restore_uses_catalog_contract_branch(tmp_path: Path) -> None:
             return_value=(1, 10000),
         ),
         patch("handlers.orders.get_storefront", return_value=storefront),
+        # Avoid live Catalog navigation_tree against empty temp DB during trail/header build.
+        patch(
+            "handlers.orders._services",
+            return_value={
+                "instagram": {"title": "Instagram", "sections": {"likes": {"title": "Likes"}}}
+            },
+        ),
         patch(
             "storefront.order_intent_to_create_bridge",
             return_value=bridge,

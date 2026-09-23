@@ -17,8 +17,14 @@ from typing import Any
 
 _BOT_ROOT = Path(__file__).resolve().parent.parent
 _DASHBOARD_ROOT = _BOT_ROOT.parent / "soldium-dashboard"
+# Append (do not insert at 0) so bot packages (config, utils, …) win over dashboard.
 if _DASHBOARD_ROOT.is_dir() and str(_DASHBOARD_ROOT) not in sys.path:
-    sys.path.insert(0, str(_DASHBOARD_ROOT))
+    sys.path.append(str(_DASHBOARD_ROOT))
+# Keep bot root ahead of dashboard if both appear on sys.path.
+_bot = str(_BOT_ROOT)
+if _bot in sys.path:
+    sys.path.remove(_bot)
+sys.path.insert(0, _bot)
 
 from catalog_core.storefront_gateway import (  # noqa: E402
     CatalogStorefrontBackend,

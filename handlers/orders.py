@@ -1685,18 +1685,40 @@ async def order_choose_catalog_node(
     if user_id is None:
         return
     entry_id = callback.data.split(":", maxsplit=2)[-1]
-    from keyboards.orders import build_catalog_node_menu, _find_catalog_node
+    from keyboards.orders import (
+        build_catalog_node_menu,
+        catalog_node_back_callback,
+        _find_catalog_node,
+        _find_catalog_parent_entry_id,
+    )
 
     node = _find_catalog_node(entry_id)
     if not node:
         await callback.answer("قسم غير صالح", show_alert=True)
         return
+    data = await state.get_data()
+    platform_key = str(data.get("platform_key") or "")
+    parent_id = _find_catalog_parent_entry_id(entry_id)
+    # Keep platform_key as the Catalog root when descending.
+    if parent_id and parent_id in _services() and not platform_key:
+        platform_key = parent_id
+    elif not platform_key:
+        # Walk up until a root key is found.
+        cursor = parent_id
+        while cursor and cursor not in _services():
+            cursor = _find_catalog_parent_entry_id(cursor)
+        if cursor and cursor in _services():
+            platform_key = cursor
+
     await state.set_state(OrderFlow.choose_subcategory)
-    await state.update_data(nav_entry_id=entry_id)
+    await state.update_data(
+        nav_entry_id=entry_id,
+        platform_key=platform_key or data.get("platform_key"),
+        section_key=entry_id,
+    )
     title = str(node.get("title") or "الخدمات")
     short_body = f"<b>{title}</b>\n\nاختر:"
-    parent = str((await state.get_data()).get("platform_key") or "")
-    back_cb = f"order:platform:{parent}" if parent else "order:nav:platforms"
+    back_cb = catalog_node_back_callback(entry_id, platform_key=platform_key or None)
     markup = build_catalog_node_menu(entry_id, back_callback=back_cb)
     has_photo = await _living_has_photo(state, user_id)
     text = _order_caption_text(
@@ -1756,7 +1778,7 @@ async def order_choose_subsection_callback(
     nested_bucket = subsections[subsection_key]
     deeper = nested_bucket.get("sections") or {}
     if deeper and not (nested_bucket.get("items") or []):
-        from keyboards.orders import build_catalog_node_menu
+        from keyboards.orders import build_catalog_node_menu, _section_back_callback
 
         await state.update_data(
             platform_key=platform_key,
@@ -1766,7 +1788,7 @@ async def order_choose_subsection_callback(
         )
         markup = build_catalog_node_menu(
             subsection_key,
-            back_callback=f"order:section:{platform_key}:{section_key}",
+            back_callback=_section_back_callback(platform_key, section_key),
         )
         title = str(nested_bucket.get("title") or "الخدمات")
         short_body = f"<b>{title}</b>\n\nاختر:"
