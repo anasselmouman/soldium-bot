@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 مزامنة أسعار المورد (USD لكل 1000) وحدود الكمية من API المزوّدين إلى جدول smm_services.
+
+Provider rate/min/max are provider-SKU-level values. Each smm_services row is
+updated by catalog_id so multiple Soldium/legacy rows sharing one provider
+external ID can each receive the same SKU fields without relying on
+UNIQUE(provider_slug, external_service_id).
 """
 
 from __future__ import annotations
@@ -292,6 +297,13 @@ def sync_provider_prices_to_db(
             else:
                 result.unchanged += 1
 
+            # Provider rate/min/max are SKU-level values from the provider API, but
+            # each Soldium/legacy row is updated by catalog_id (row identity).
+            # Multiple Catalog/legacy services may share the same provider SKU;
+            # each scanned row receives the same provider fields independently.
+            # Do not UPDATE ... WHERE provider_slug+external alone (that assumed
+            # uniqueness and would touch every twin on every scan pass).
+            catalog_id = str(row["catalog_id"])
             conn.execute(
                 """
                 UPDATE smm_services
@@ -300,7 +312,7 @@ def sync_provider_prices_to_db(
                     max_qty = ?,
                     provider_api_account = ?,
                     provider_price_updated_at = ?
-                WHERE provider_slug = ? AND external_service_id = ?
+                WHERE catalog_id = ?
                 """,
                 (
                     entry.rate_usd,
@@ -308,8 +320,7 @@ def sync_provider_prices_to_db(
                     entry.max_qty,
                     account_to_persist,
                     now,
-                    provider_slug,
-                    str(external_id),
+                    catalog_id,
                 ),
             )
 

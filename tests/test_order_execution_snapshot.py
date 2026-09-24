@@ -66,6 +66,49 @@ def test_create_order_persists_execution_snapshot(bot_db: Path):
     assert int(row["quantity"]) == 50
 
 
+def test_two_orders_same_provider_external_keep_independent_snapshots(bot_db: Path):
+    """Order create freezes external_service_id_snapshot per order — no SKU unique lookup."""
+    oid_a = db.create_order_with_balance_hold(
+        user_id=42,
+        service_name="A",
+        service_id="svc_a",
+        link="https://example.com/a",
+        quantity=10,
+        amount=1.0,
+        provider_slug="gozibra",
+        api_account="default",
+        catalog_id="svc_a",
+        external_service_id_snapshot="4210",
+    )
+    oid_b = db.create_order_with_balance_hold(
+        user_id=42,
+        service_name="B",
+        service_id="svc_b",
+        link="https://example.com/b",
+        quantity=20,
+        amount=2.0,
+        provider_slug="gozibra",
+        api_account="default",
+        catalog_id="svc_b",
+        external_service_id_snapshot="4210",
+    )
+    assert oid_a is not None and oid_b is not None and oid_a != oid_b
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, catalog_id, service_id, external_service_id_snapshot, quantity
+            FROM orders WHERE id IN (?, ?) ORDER BY id
+            """,
+            (oid_a, oid_b),
+        ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["catalog_id"] == "svc_a"
+    assert rows[1]["catalog_id"] == "svc_b"
+    assert rows[0]["external_service_id_snapshot"] == "4210"
+    assert rows[1]["external_service_id_snapshot"] == "4210"
+    assert int(rows[0]["quantity"]) == 10
+    assert int(rows[1]["quantity"]) == 20
+
 def test_price_unchanged_when_catalog_price_changes(bot_db: Path):
     oid = db.create_order_with_balance_hold(
         user_id=42,

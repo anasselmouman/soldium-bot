@@ -715,17 +715,213 @@ def pending_init_db_migrations(*, db_path: Path | None = None) -> list[str]:
         }
         if "deposits" in tables and "idx_deposits_active_proof_unique" not in index_names:
             pending.append("create_index:idx_deposits_active_proof_unique")
-        if smm_has_catalog_id and "idx_smm_services_provider_external" not in index_names:
-            pending.append("create_index:idx_smm_services_provider_external")
+        # UNIQUE(provider_slug, external_service_id) must be dropped so multiple
+        # Soldium/legacy rows may share one provider SKU. Detect table UNIQUE and
+        # the named unique index — either means the migration is still pending.
+        if smm_has_catalog_id and _smm_provider_external_unique_enforced(connection):
+            pending.append("smm_services_drop_provider_external_unique")
     finally:
         connection.close()
     return pending
 
 
+def _smm_provider_external_unique_enforced(connection: sqlite3.Connection) -> bool:
+    """True when smm_services still enforces UNIQUE(provider_slug, external_service_id).
+
+    Covers the table-level UNIQUE (sqlite_autoindex_*) and the named unique index
+    ``idx_smm_services_provider_external``.
+    """
+    try:
+        indexes = connection.execute("PRAGMA index_list('smm_services')").fetchall()
+    except sqlite3.Error:
+        return False
+    for idx in indexes:
+        # PRAGMA index_list: (seq, name, unique, origin, partial) — Row or tuple
+        try:
+            is_unique = int(idx["unique"] if hasattr(idx, "keys") else idx[2])
+            name = str(idx["name"] if hasattr(idx, "keys") else idx[1] or "")
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        if not is_unique:
+            continue
+        try:
+            cols = [
+                str(info["name"] if hasattr(info, "keys") else info[2])
+                for info in connection.execute(
+                    f"PRAGMA index_info('{name.replace(chr(39), '')}')"
+                ).fetchall()
+            ]
+        except sqlite3.Error:
+            continue
+        if cols == ["provider_slug", "external_service_id"]:
+            return True
+    # Fallback: table DDL still declares the UNIQUE clause (before indexes introspected).
+    try:
+        row = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'smm_services'
+            """
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    if row is None:
+        return False
+    ddl = str(row["sql"] if hasattr(row, "keys") else row[0] or "")
+    compact = "".join(ddl.lower().split())
+    return "unique(provider_slug,external_service_id)" in compact
+
+
+_SMM_SERVICES_CATALOG_DDL_NO_PROVIDER_EXTERNAL_UNIQUE = """
+CREATE TABLE {table_name} (
+    catalog_id TEXT PRIMARY KEY,
+    external_service_id TEXT NOT NULL,
+    provider_slug TEXT NOT NULL DEFAULT 'gozibra',
+    category TEXT NOT NULL DEFAULT '',
+    name_ar TEXT NOT NULL DEFAULT '',
+    provider_price_usd REAL NOT NULL DEFAULT 0,
+    local_price_dh REAL NOT NULL DEFAULT 0,
+    min_qty INTEGER NOT NULL DEFAULT 1,
+    max_qty INTEGER NOT NULL DEFAULT 1000000,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    platform_key TEXT NOT NULL DEFAULT '',
+    section_key TEXT,
+    subsection_key TEXT,
+    local_item_id TEXT NOT NULL DEFAULT '',
+    platform_title TEXT NOT NULL DEFAULT '',
+    section_title TEXT,
+    subsection_title TEXT,
+    fulfillment_mode TEXT NOT NULL DEFAULT 'auto',
+    provider_api_account TEXT,
+    provider_price_updated_at TEXT,
+    service_id TEXT NOT NULL DEFAULT ''
+)
+"""
+
+
+def _recreate_smm_services_nonunique_indexes(connection: sqlite3.Connection) -> None:
+    """Recreate smm_services indexes after a table rebuild (no provider/external UNIQUE)."""
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_smm_services_active
+        ON smm_services (is_active, platform_key)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_smm_services_fulfillment
+        ON smm_services (fulfillment_mode, platform_key)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_smm_services_provider
+        ON smm_services (provider_slug, is_active)
+        """
+    )
+    # Non-unique lookup aid for provider-SKU scans (limits / sync SELECT).
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_smm_services_provider_external
+        ON smm_services (provider_slug, external_service_id)
+        """
+    )
+
+
+def _migrate_smm_services_drop_provider_external_unique(
+    connection: sqlite3.Connection,
+) -> None:
+    """Remove UNIQUE(provider_slug, external_service_id) from smm_services.
+
+    Idempotent. SQLite cannot DROP a table UNIQUE without recreation, so this
+    rebuilds the table when uniqueness is still enforced. Preserves every row
+    and column; catalog_id remains the PK.
+    """
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(smm_services)").fetchall()
+    }
+    if "catalog_id" not in columns:
+        return
+    if not _smm_provider_external_unique_enforced(connection):
+        # Ensure the non-unique lookup index exists even when UNIQUE is already gone.
+        _recreate_smm_services_nonunique_indexes(connection)
+        return
+
+    # Column order for INSERT…SELECT — only columns present on the live table.
+    preferred = (
+        "catalog_id",
+        "external_service_id",
+        "provider_slug",
+        "category",
+        "name_ar",
+        "provider_price_usd",
+        "local_price_dh",
+        "min_qty",
+        "max_qty",
+        "is_active",
+        "platform_key",
+        "section_key",
+        "subsection_key",
+        "local_item_id",
+        "platform_title",
+        "section_title",
+        "subsection_title",
+        "fulfillment_mode",
+        "provider_api_account",
+        "provider_price_updated_at",
+        "service_id",
+    )
+    copy_cols = [c for c in preferred if c in columns]
+    extras = [c for c in sorted(columns) if c not in preferred]
+    if extras:
+        # Unexpected columns: refuse rather than silently drop data.
+        raise RuntimeError(
+            "smm_services_drop_provider_external_unique: unexpected columns "
+            f"{extras}; refusing rebuild"
+        )
+
+    col_csv = ", ".join(copy_cols)
+    tmp = "smm_services_no_pe_unique"
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute("DROP TABLE IF EXISTS " + tmp)
+        connection.execute(
+            _SMM_SERVICES_CATALOG_DDL_NO_PROVIDER_EXTERNAL_UNIQUE.format(table_name=tmp)
+        )
+        connection.execute(
+            f"INSERT INTO {tmp} ({col_csv}) SELECT {col_csv} FROM smm_services"
+        )
+        before = connection.execute("SELECT COUNT(*) FROM smm_services").fetchone()[0]
+        after = connection.execute(f"SELECT COUNT(*) FROM {tmp}").fetchone()[0]
+        if int(before) != int(after):
+            raise RuntimeError(
+                f"smm_services unique-drop row count mismatch: before={before} after={after}"
+            )
+        connection.execute("DROP TABLE smm_services")
+        connection.execute(f"ALTER TABLE {tmp} RENAME TO smm_services")
+        _recreate_smm_services_nonunique_indexes(connection)
+        if _smm_provider_external_unique_enforced(connection):
+            raise RuntimeError(
+                "smm_services unique-drop failed: UNIQUE(provider_slug, external_service_id) still present"
+            )
+        connection.commit()
+        logger.info(
+            "Dropped UNIQUE(provider_slug, external_service_id) on smm_services "
+            "(%s rows preserved)",
+            after,
+        )
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def _migrate_smm_services_catalog_identity(connection: sqlite3.Connection) -> None:
     """
     يرقّي smm_services إلى هوية مركّبة:
-    catalog_id (PK فريد للبوت) + (provider_slug, external_service_id) فريد.
+    catalog_id (PK فريد للبوت). Provider SKU (provider_slug, external_service_id)
+    may be shared by multiple rows — no UNIQUE on that pair.
     """
     columns = {
         str(row["name"])
@@ -752,32 +948,9 @@ def _migrate_smm_services_catalog_identity(connection: sqlite3.Connection) -> No
     connection.execute("BEGIN IMMEDIATE")
     try:
         connection.execute(
-            """
-            CREATE TABLE smm_services_v2 (
-                catalog_id TEXT PRIMARY KEY,
-                external_service_id TEXT NOT NULL,
-                provider_slug TEXT NOT NULL DEFAULT 'gozibra',
-                category TEXT NOT NULL DEFAULT '',
-                name_ar TEXT NOT NULL DEFAULT '',
-                provider_price_usd REAL NOT NULL DEFAULT 0,
-                local_price_dh REAL NOT NULL DEFAULT 0,
-                min_qty INTEGER NOT NULL DEFAULT 1,
-                max_qty INTEGER NOT NULL DEFAULT 1000000,
-                is_active INTEGER NOT NULL DEFAULT 1,
-                platform_key TEXT NOT NULL DEFAULT '',
-                section_key TEXT,
-                subsection_key TEXT,
-                local_item_id TEXT NOT NULL DEFAULT '',
-                platform_title TEXT NOT NULL DEFAULT '',
-                section_title TEXT,
-                subsection_title TEXT,
-                fulfillment_mode TEXT NOT NULL DEFAULT 'auto',
-                provider_api_account TEXT,
-                provider_price_updated_at TEXT,
-                service_id TEXT NOT NULL DEFAULT '',
-                UNIQUE(provider_slug, external_service_id)
+            _SMM_SERVICES_CATALOG_DDL_NO_PROVIDER_EXTERNAL_UNIQUE.format(
+                table_name="smm_services_v2"
             )
-            """
         )
         connection.execute(
             """
@@ -804,30 +977,7 @@ def _migrate_smm_services_catalog_identity(connection: sqlite3.Connection) -> No
         )
         connection.execute("DROP TABLE smm_services")
         connection.execute("ALTER TABLE smm_services_v2 RENAME TO smm_services")
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_smm_services_active
-            ON smm_services (is_active, platform_key)
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_smm_services_fulfillment
-            ON smm_services (fulfillment_mode, platform_key)
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_smm_services_provider
-            ON smm_services (provider_slug, is_active)
-            """
-        )
-        connection.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_smm_services_provider_external
-            ON smm_services (provider_slug, external_service_id)
-            """
-        )
+        _recreate_smm_services_nonunique_indexes(connection)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -1255,6 +1405,7 @@ def _apply_init_db_schema_and_migrations() -> None:
         _migrate_provider_accounts_display_name(connection)
 
         _migrate_smm_services_catalog_identity(connection)
+        _migrate_smm_services_drop_provider_external_unique(connection)
 
         if "provider_slug" not in order_columns:
             connection.execute(

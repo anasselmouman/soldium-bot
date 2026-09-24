@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""حدود الكمية (min/max) لكل مزوّد — من قاعدة البيانات مع ذاكرة مؤقتة اختيارية."""
+"""حدود الكمية (min/max) لكل مزوّد — من قاعدة البيانات مع ذاكرة مؤقتة اختيارية.
+
+Cache is intentionally keyed by provider SKU
+``(provider_slug, external_service_id)`` — not by Soldium ``catalog_id`` /
+``svc_*``. Multiple Catalog services may share one provider external ID and
+therefore consume the same cached min/max. That is correct: limits originate
+from the provider API for that SKU, not from per-Soldium commercial config.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +21,8 @@ logger = logging.getLogger(__name__)
 
 CATALOG_TTL_SECONDS = 300
 
-# (provider_slug, external_service_id) -> (min, max)
+# Provider-SKU-level cache: (provider_slug, external_service_id) -> (min, max).
+# Shared across every Catalog/legacy Soldium service mapped to that SKU.
 _LIMITS: dict[tuple[str, int], tuple[int, int]] = {}
 _UPDATED_AT: float = 0.0
 
@@ -27,6 +35,7 @@ def _safe_int(value: object, default: int = 0) -> int:
 
 
 def _limits_key(provider_slug: str, external_service_id: int) -> tuple[str, int]:
+    """Provider-SKU cache key (not Soldium catalog_id / svc_*)."""
     return str(provider_slug or "").strip().lower(), int(external_service_id)
 
 
@@ -35,6 +44,7 @@ def get_provider_limits(
     *,
     provider_slug: str | None = None,
 ) -> tuple[int, int] | None:
+    """Return provider-SKU min/max (cache, then DB consensus)."""
     from services.provider_registry import get_default_provider_slug
 
     slug = str(provider_slug or get_default_provider_slug()).strip().lower()

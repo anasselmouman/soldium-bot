@@ -721,32 +721,90 @@ def reload_services_mapping(target: dict[str, Any]) -> None:
     target.update(fresh)
 
 
+def _normalize_limit_pair(min_qty: object, max_qty: object) -> tuple[int, int]:
+    lo = int(min_qty or 1)
+    hi = int(max_qty or 0)
+    if hi < lo:
+        hi = lo
+    return lo, hi
+
+
 def get_provider_limits_from_db(
     provider_slug: str,
     external_service_id: int,
 ) -> tuple[int, int] | None:
+    """Return provider-SKU min/max for (provider_slug, external_service_id).
+
+    Limits are provider-SKU-level (same values for every Soldium service that
+    maps to that provider external ID). When multiple smm_services rows match:
+
+    - If all matching rows agree on (min_qty, max_qty), return that pair.
+    - If only active rows agree, return the active consensus.
+    - If values disagree with no consensus, log and return None (never an
+      arbitrary fetchone()).
+    """
+    slug = str(provider_slug).strip().lower()
+    external = str(external_service_id)
+    rows: list[Any] = []
     try:
         with _get_connection() as conn:
-            row = conn.execute(
-                """
-                SELECT min_qty, max_qty FROM smm_services
-                WHERE provider_slug = ? AND external_service_id = ?
-                """,
-                (str(provider_slug).strip().lower(), str(external_service_id)),
-            ).fetchone()
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT catalog_id, min_qty, max_qty, is_active
+                    FROM smm_services
+                    WHERE provider_slug = ? AND external_service_id = ?
+                    ORDER BY catalog_id ASC
+                    """,
+                    (slug, external),
+                ).fetchall()
+            )
     except sqlite3.OperationalError:
         try:
             with _get_connection() as conn:
-                row = conn.execute(
-                    "SELECT min_qty, max_qty FROM smm_services WHERE service_id = ?",
-                    (str(external_service_id),),
-                ).fetchone()
+                rows = list(
+                    conn.execute(
+                        """
+                        SELECT catalog_id, min_qty, max_qty, 1 AS is_active
+                        FROM smm_services
+                        WHERE service_id = ?
+                        ORDER BY catalog_id ASC
+                        """,
+                        (external,),
+                    ).fetchall()
+                )
         except sqlite3.OperationalError:
             return None
-    if not row:
+
+    if not rows:
         return None
-    min_qty = int(row["min_qty"] or 1)
-    max_qty = int(row["max_qty"] or 0)
-    if max_qty < min_qty:
-        max_qty = min_qty
-    return min_qty, max_qty
+
+    def _pair(row: Any) -> tuple[int, int]:
+        return _normalize_limit_pair(row["min_qty"], row["max_qty"])
+
+    all_pairs = {_pair(row) for row in rows}
+    if len(all_pairs) == 1:
+        return all_pairs.pop()
+
+    active_rows = [row for row in rows if int(row["is_active"] or 0) == 1]
+    if active_rows:
+        active_pairs = {_pair(row) for row in active_rows}
+        if len(active_pairs) == 1:
+            logger.warning(
+                "Provider limits disagree across inactive twins for %s/%s; "
+                "using active-row consensus %s",
+                slug,
+                external,
+                next(iter(active_pairs)),
+            )
+            return active_pairs.pop()
+
+    logger.warning(
+        "Ambiguous provider limits for %s/%s across %s smm_services rows "
+        "(pairs=%s); refusing arbitrary pick",
+        slug,
+        external,
+        len(rows),
+        sorted(all_pairs),
+    )
+    return None

@@ -168,11 +168,89 @@ def test_pending_detects_missing_required_indexes(tmp_path: Path) -> None:
             WHERE status = 'pending' OR status LIKE 'approved:%'
             """
         )
-        connection.execute("DROP INDEX IF EXISTS idx_smm_services_provider_external")
         connection.commit()
     pending = db.pending_init_db_migrations(db_path=path)
-    assert "create_index:idx_smm_services_provider_external" in pending
     assert "create_index:idx_deposits_active_proof_unique" not in pending
+    assert "create_index:idx_smm_services_provider_external" not in pending
+    assert "smm_services_drop_provider_external_unique" not in pending
+
+
+def test_pending_detects_provider_external_unique_still_present(tmp_path: Path) -> None:
+    path = tmp_path / "pe_unique_pending.db"
+    db.DB_PATH = path
+    db.init_db()
+    assert db.pending_init_db_migrations(db_path=path) == []
+
+    # Simulate a legacy DB that still has the UNIQUE pair constraint.
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("DROP INDEX IF EXISTS idx_smm_services_provider_external")
+        connection.execute(
+            """
+            CREATE TABLE smm_services_legacy_unique (
+                catalog_id TEXT PRIMARY KEY,
+                external_service_id TEXT NOT NULL,
+                provider_slug TEXT NOT NULL DEFAULT 'gozibra',
+                category TEXT NOT NULL DEFAULT '',
+                name_ar TEXT NOT NULL DEFAULT '',
+                provider_price_usd REAL NOT NULL DEFAULT 0,
+                local_price_dh REAL NOT NULL DEFAULT 0,
+                min_qty INTEGER NOT NULL DEFAULT 1,
+                max_qty INTEGER NOT NULL DEFAULT 1000000,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                platform_key TEXT NOT NULL DEFAULT '',
+                section_key TEXT,
+                subsection_key TEXT,
+                local_item_id TEXT NOT NULL DEFAULT '',
+                platform_title TEXT NOT NULL DEFAULT '',
+                section_title TEXT,
+                subsection_title TEXT,
+                fulfillment_mode TEXT NOT NULL DEFAULT 'auto',
+                provider_api_account TEXT,
+                provider_price_updated_at TEXT,
+                service_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(provider_slug, external_service_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO smm_services_legacy_unique (
+                catalog_id, external_service_id, service_id, provider_slug, name_ar
+            )
+            SELECT catalog_id, external_service_id, service_id, provider_slug, name_ar
+            FROM smm_services
+            """
+        )
+        connection.execute("DROP TABLE smm_services")
+        connection.execute(
+            "ALTER TABLE smm_services_legacy_unique RENAME TO smm_services"
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX idx_smm_services_provider_external
+            ON smm_services (provider_slug, external_service_id)
+            """
+        )
+        connection.commit()
+
+    pending = db.pending_init_db_migrations(db_path=path)
+    assert "smm_services_drop_provider_external_unique" in pending
+
+    db.init_db()
+    assert db.pending_init_db_migrations(db_path=path) == []
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        assert not db._smm_provider_external_unique_enforced(connection)
+        # Non-unique lookup index must exist.
+        row = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type='index' AND name='idx_smm_services_provider_external'
+            """
+        ).fetchone()
+        assert row is not None
+        assert "UNIQUE" not in str(row["sql"] or "").upper()
 
 
 def test_missing_index_triggers_pre_migration_backup(
